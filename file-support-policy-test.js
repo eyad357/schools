@@ -94,14 +94,29 @@ const FileSupportPolicy = require('../app/js/file-support-policy.js');
       if (!FileSupportPolicy.isUploadAllowed('file.' + ext)) throw new Error('expected allowed');
     });
   }
-  const expectedBlocked = ['zip', 'rar', '7z', 'tar', 'gz'];
-  for (const ext of expectedBlocked) {
-    await check(`policy: .${ext} is upload-blocked (archives)`, async () => {
-      if (FileSupportPolicy.isUploadAllowed('file.' + ext)) throw new Error('expected blocked');
+  // Phase 3 policy change: archives are now accepted as opaque evidence
+  // (universal intake) rather than blocked — see
+  // PHASE_3_EVIDENCE_INTAKE_ARCHITECTURE.md "Known Archives Policy".
+  // Never auto-extracted; no internal preview.
+  const expectedArchivesAllowed = ['zip', 'rar', '7z', 'tar', 'gz'];
+  for (const ext of expectedArchivesAllowed) {
+    await check(`policy: .${ext} is upload-allowed (archives, Phase 3)`, async () => {
+      if (!FileSupportPolicy.isUploadAllowed('file.' + ext)) throw new Error('expected allowed');
+      if (FileSupportPolicy.isPreviewSupported('file.' + ext)) throw new Error('archives must still have no internal preview');
     });
   }
-  await check('policy: unknown extension is upload-blocked', async () => {
-    if (FileSupportPolicy.isUploadAllowed('file.xyzabc')) throw new Error('expected blocked');
+  // Phase 3 policy change: a genuinely unrecognized (but not
+  // deny-listed-dangerous) extension is now accepted as "unknown but
+  // safe" evidence rather than rejected outright — this is the core of
+  // the "universal file intake" requirement (uploadability must not
+  // depend on the app having anticipated the format in advance).
+  await check('policy: unknown-but-safe extension is upload-allowed (Phase 3)', async () => {
+    if (!FileSupportPolicy.isUploadAllowed('file.xyzabc')) throw new Error('expected allowed as unknown-but-safe');
+    if (FileSupportPolicy.isPreviewSupported('file.xyzabc')) throw new Error('unknown types must have no internal preview');
+  });
+  await check('policy: a deny-listed dangerous extension is still upload-blocked', async () => {
+    if (FileSupportPolicy.isUploadAllowed('file.exe')) throw new Error('expected .exe to remain blocked');
+    if (FileSupportPolicy.isUploadAllowed('file.ps1')) throw new Error('expected .ps1 to remain blocked');
   });
 
   const previewMatrix = {
@@ -186,14 +201,35 @@ const FileSupportPolicy = require('../app/js/file-support-policy.js');
     if (!body.error || !body.allowedExtensions) throw new Error('expected a friendly error body with allowedExtensions');
   });
 
-  await check('upload: a .zip is rejected (archives disabled)', async () => {
-    const r = await uploadRaw('bundle.zip', Buffer.from([0x50, 0x4b, 0x03, 0x04]), 'application/zip');
-    if (r.status !== 415) throw new Error('expected 415, got ' + r.status);
+  await check('upload: a .zip is accepted and stored as opaque evidence (Phase 3 archives policy)', async () => {
+    // A minimal *valid* empty zip (End Of Central Directory record only)
+    // does not start with the PK\x03\x04 local-file-header signature our
+    // own policy checks for non-empty zips, so build a one-entry zip via
+    // Node's zlib to get a realistic PK\x03\x04-prefixed fixture.
+    const zlib = require('zlib');
+    const entryData = Buffer.from('evidence');
+    const deflated = zlib.deflateRawSync(entryData);
+    const localHeader = Buffer.concat([
+      Buffer.from([0x50, 0x4b, 0x03, 0x04]), // local file header signature
+      Buffer.alloc(26), // rest of the local header, zeroed — enough for our own signature check, not a fully-valid archive
+    ]);
+    const zipBytes = Buffer.concat([localHeader, deflated]);
+    const r = await uploadRaw('bundle.zip', zipBytes, 'application/zip');
+    if (r.status !== 200) throw new Error('expected 200, got ' + r.status);
+    const body = await r.json();
+    if (!body.sha256 || body.size !== zipBytes.length) throw new Error('expected sha256+size in response, got ' + JSON.stringify(body));
   });
 
-  await check('upload: an unknown extension is rejected', async () => {
-    const r = await uploadRaw('mystery.xyzabc', Buffer.from('???'), 'application/octet-stream');
+  await check('upload: an unknown-but-safe extension is accepted (Phase 3 universal intake)', async () => {
+    const r = await uploadRaw('mystery.xyzabc', Buffer.from('some evidence content nobody anticipated the format of'), 'application/octet-stream');
+    if (r.status !== 200) throw new Error('expected 200, got ' + r.status);
+  });
+
+  await check('upload: a deny-listed dangerous extension is still rejected', async () => {
+    const r = await uploadRaw('setup.exe', Buffer.from('MZ...'), 'application/octet-stream');
     if (r.status !== 415) throw new Error('expected 415, got ' + r.status);
+    const body = await r.json();
+    if (body.reason !== 'DANGEROUS_TYPE') throw new Error('expected DANGEROUS_TYPE, got ' + body.reason);
   });
 
   await check('upload: a file named .pdf but containing plain text is rejected (spoofed extension)', async () => {

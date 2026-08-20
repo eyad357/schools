@@ -3,6 +3,7 @@
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
+const crypto = require('crypto');
 const log = require('../../electron/utils/logger');
 
 const MANIFEST = require('../data/evidence-manifest.json'); // code -> { relPath, domainId, standardId, priv, text }
@@ -147,15 +148,56 @@ async function getFilePath(evidenceRoot, code, name) {
   return full;
 }
 
+function sha256Buffer(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
+/**
+ * Given a desired filename inside `dir`, returns a filename guaranteed not
+ * to already exist in that directory — the original name if it's free,
+ * otherwise "name (1).ext", "name (2).ext", etc. (the same disambiguation
+ * pattern Windows Explorer itself uses for copy conflicts, so the result
+ * looks familiar rather than invented). Never overwrites; see Phase 3's
+ * "Duplicate Handling" — silently overwriting an existing evidence file
+ * on re-upload was a real, undocumented gap this replaces.
+ */
+function generateNonConflictingName(dir, filename) {
+  const dot = filename.lastIndexOf('.');
+  const base = dot > 0 ? filename.slice(0, dot) : filename;
+  const extPart = dot > 0 ? filename.slice(dot) : '';
+  let candidate = filename;
+  let n = 1;
+  while (fs.existsSync(path.join(dir, candidate))) {
+    candidate = `${base} (${n})${extPart}`;
+    n++;
+  }
+  return candidate;
+}
+
 /**
  * Writes an uploaded file's bytes into an indicator's folder, creating the
  * folder if it doesn't exist yet. `dir` must already be a resolved,
  * trusted indicator folder path (callers resolve it via folderForCode()
  * first, since an unknown indicator is a distinct 400-vs-500 case the
  * caller needs to handle before ever reaching this function). `filename`
- * must already be sanitized (path.basename()'d) by the caller — this
- * function does not re-validate it, matching the caller's existing
- * upload-boundary validation via FileSupportPolicy.
+ * must already be sanitized (path.basename()'d and FileSupportPolicy-
+ * validated) by the caller — this function does not re-validate filename
+ * safety, but it does own three things the caller does not:
+ *
+ *   1. Duplicate-safe naming — never silently overwrites an existing file
+ *      with the same name (see generateNonConflictingName above).
+ *   2. Atomic storage — writes to a hidden temp file in the SAME
+ *      directory (so the final rename is same-filesystem and therefore
+ *      atomic on both POSIX and Windows), then renames it into place.
+ *      Any failure during the write leaves no partially-written file
+ *      under a real evidence filename — either the temp file is cleaned
+ *      up, or (if even that fails) it's left with its own hidden
+ *      ".uploading-*" name, never the name real evidence would use, so it
+ *      can never be mistaken for a successfully-stored file.
+ *   3. Checksum — returns the SHA-256 of the bytes actually written, ideal
+ *      for later corruption/duplicate-content detection (Phase 3
+ *      "Checksum / Integrity"), computed from the same in-memory buffer
+ *      that gets written, not re-read from disk afterward.
  *
  * Throws on any filesystem failure; callers are expected to catch and
  * translate that into their own error response, exactly as before this
@@ -163,9 +205,24 @@ async function getFilePath(evidenceRoot, code, name) {
  */
 function writeEvidenceFile(dir, filename, body) {
   fs.mkdirSync(dir, { recursive: true });
-  const destPath = path.join(dir, filename);
-  fs.writeFileSync(destPath, body);
-  return destPath;
+  const finalName = generateNonConflictingName(dir, filename);
+  const destPath = path.join(dir, finalName);
+  const tempPath = path.join(dir, `.${finalName}.uploading-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+
+  const sha256 = sha256Buffer(body);
+  try {
+    fs.writeFileSync(tempPath, body);
+    const written = fs.statSync(tempPath);
+    if (written.size !== body.length) {
+      throw new Error(`incomplete write: expected ${body.length} bytes, wrote ${written.size}`);
+    }
+    fs.renameSync(tempPath, destPath); // atomic on the same filesystem (POSIX rename(2) / Windows MoveFileEx)
+  } catch (err) {
+    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch (_) { /* best-effort cleanup only */ }
+    throw err;
+  }
+
+  return { destPath, filename: finalName, size: body.length, sha256 };
 }
 
 /**
@@ -223,12 +280,9 @@ function renameEvidenceFile(evidenceRoot, code, oldName, newName) {
 
   const safeOld = path.basename(oldName);
   const safeNew = path.basename(newName).trim();
-  if (!safeNew || safeNew === '.' || safeNew === '..') {
-    return { ok: false, reason: 'INVALID_NAME' };
-  }
-  // eslint-disable-next-line no-control-regex
-  if (/[\\/:*?"<>|\x00-\x1f]/.test(safeNew)) {
-    return { ok: false, reason: 'INVALID_CHARS' };
+  const nameCheck = FileSupportPolicy.validateFilename(safeNew);
+  if (!nameCheck.ok) {
+    return { ok: false, reason: nameCheck.reason };
   }
 
   const oldPath = path.join(dir, safeOld);
@@ -320,6 +374,7 @@ module.exports = {
   writeEvidenceFile,
   deleteEvidenceFile,
   renameEvidenceFile,
+  generateNonConflictingName,
   integrityCheck,
   stats,
   indicatorMap,
