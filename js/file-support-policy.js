@@ -305,6 +305,27 @@
       displayNameAr: 'عرض PowerPoint', fallback: 'preview', signature: SIG.ZIP,
       notes: 'Extracts slide titles/bullet text/embedded images from the raw OOXML. Does NOT reproduce slide layout, fonts, positioning, or animations — partial fidelity by design, not a bug.',
     },
+    ppsx: {
+      // PowerPoint Show — the exact same OOXML/ZIP package format as
+      // .pptx (identical ppt/slides/slideN.xml internal structure; the
+      // only difference is a top-level content-type flag meaning "open
+      // directly into slideshow mode" rather than "open into edit mode").
+      // Found missing during Phase 4's audit while testing classification
+      // against the real sample evidence already committed in this repo —
+      // a real .ppsx file was silently falling into the generic "unknown
+      // but safe" bucket (Phase 3) with no preview at all, despite the
+      // existing pptx-text-extract engine already being fully capable of
+      // rendering it (it parses generic OOXML slide XML, format-identical
+      // between the two extensions — no viewer.js change was needed to
+      // support this, only this missing policy entry).
+      category: 'powerpoint', mimeTypes: ['application/vnd.openxmlformats-officedocument.presentationml.slideshow'],
+      upload: { allowed: true }, maxSizeBytes: 100 * MB,
+      preview: { supported: true, engine: 'pptx-text-extract', fidelity: 'partial' },
+      contentExtraction: { supported: true }, thumbnail: { supported: false, engine: null },
+      search: { supported: true }, ocr: { supported: false },
+      displayNameAr: 'عرض PowerPoint (شرائح)', fallback: 'preview', signature: SIG.ZIP,
+      notes: 'Same OOXML structure and same partial-fidelity caveat as .pptx above.',
+    },
     ppt: {
       category: 'powerpoint', mimeTypes: ['application/vnd.ms-powerpoint'],
       upload: { allowed: true }, maxSizeBytes: 100 * MB,
@@ -584,6 +605,50 @@
     };
   }
 
+  // ── Phase 4: viewer capability model ─────────────────────────────────
+  // Capabilities are a property of the PREVIEW ENGINE, not the extension
+  // (every .pdf/.xlsx/etc. that shares an engine gets the exact same
+  // capability set) — this deliberately mirrors app/js/viewer.js's own
+  // `renderersByEngine` dispatch table, keyed by the same engine names,
+  // so the two stay mechanically checkable against each other (see
+  // scripts/viewer-lifecycle-test.js's "capabilities match reality"
+  // check) instead of silently drifting apart the way the pre-Phase-0
+  // per-format tables once did (see FILE-SUPPORT-ARCHITECTURE-REPORT.md).
+  //
+  // Every flag below reflects what the CURRENT viewer.js render function
+  // for that engine actually wires up (verified by reading each function
+  // during the Phase 4 audit — see PHASE_4_VIEWER_AUDIT.md) — not an
+  // aspirational or planned capability. A capability appears here if and
+  // only if a real toolbar control/keyboard shortcut for it exists today.
+  const VIEWER_CAPABILITIES_BY_ENGINE = {
+    'pdfjs': { zoom: true, fitWidth: true, fitPage: true, pageNavigation: true, thumbnails: true, rotate: true, search: true, print: true, fullscreen: true },
+    'mammoth': { zoom: true, search: true, fullscreen: true },
+    'sheetjs': { sheetNavigation: true, search: true, fullscreen: true },
+    'pptx-text-extract': { slideNavigation: true, search: true, fullscreen: true },
+    'native-image': { zoom: true, pan: true, rotate: true, gallery: true, fullscreen: true },
+    'native-media-video': { playback: true, seek: true, volume: true, playbackSpeed: true, fullscreen: true },
+    'native-media-audio': { playback: true, seek: true, volume: true, playbackSpeed: true },
+    'plaintext': { zoom: true, search: true, fullscreen: true },
+  };
+  const NO_CAPABILITIES = Object.freeze({});
+
+  /**
+   * Given a filename/extension, returns the capability flags its preview
+   * (if any) actually supports — e.g. { zoom:true, pageNavigation:true,
+   * search:true, ... } for a PDF, or an empty object for a type with no
+   * internal preview (external-open/fallback types, and the Phase 3
+   * "unknown but safe" tier, none of which render any format-specific
+   * toolbar controls). This is the data half of Phase 4's viewer-resolver
+   * concept — app/js/viewer.js's `renderersByEngine` table remains the
+   * single place that actually DOES the rendering; this function only
+   * describes what that rendering, once it happens, will let the user do.
+   */
+  function getViewerCapabilities(filenameOrExt) {
+    const p = getPolicy(filenameOrExt);
+    if (!p || !p.preview.supported || !p.preview.engine) return NO_CAPABILITIES;
+    return VIEWER_CAPABILITIES_BY_ENGINE[p.preview.engine] || NO_CAPABILITIES;
+  }
+
   return {
     EXTENSIONS,
     CATEGORIES,
@@ -592,6 +657,7 @@
     MAX_UPLOAD_BYTES,
     DEFAULT_UNKNOWN_MAX_BYTES,
     MAX_FILENAME_LENGTH,
+    VIEWER_CAPABILITIES_BY_ENGINE,
     validateFilename,
     getExtension,
     getPolicy,
@@ -605,5 +671,6 @@
     allowedExtensionsList,
     checkMagicBytes,
     classifyUpload,
+    getViewerCapabilities,
   };
 });

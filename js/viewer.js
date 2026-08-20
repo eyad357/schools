@@ -249,9 +249,29 @@ const Viewer = (function () {
     if (state.pdfDoc && typeof PDFEngine !== 'undefined') PDFEngine.destroyDocument(state.pdfDoc);
     else if (state.pdfDoc) { try { state.pdfDoc.destroy(); } catch {} }
     state.pdfDoc = null;
+    // PDF's two IntersectionObservers (lazy page rendering + current-page
+    // tracking) were previously only ever disconnected at the START of
+    // the NEXT renderAllPdfPages() call — i.e. only when re-viewing
+    // another PDF. Closing the viewer entirely, or switching to a
+    // non-PDF file, left both observers (and their closures over the
+    // old document's `wraps`/page objects) alive and registered
+    // indefinitely. Found during Phase 4's lifecycle audit; fixed here
+    // so every viewer-closing path (not just "open another PDF") tears
+    // them down, matching the same pattern already used for pdfDoc/
+    // objectUrls/mediaCleanup right above and below.
+    if (pdfObserver) { pdfObserver.disconnect(); pdfObserver = null; }
+    if (pdfPageTracker) { pdfPageTracker.disconnect(); pdfPageTracker = null; }
     if (state.mediaCleanup) { try { state.mediaCleanup(); } catch {} }
     const v = dom && dom.content.querySelector('video, audio');
     if (v) { try { v.pause(); v.src = ''; v.load(); } catch {} }
+    // Same class of gap as the PDF observers above: the image viewer's
+    // pan (drag-to-move) listeners live on `window` (needed so dragging
+    // still tracks the mouse outside the image element) and were
+    // previously only removed right before the NEXT image render, not on
+    // close/switch-away. Bounded (never more than one stale pair at a
+    // time) but real, and unnecessary — remove them on every cleanup.
+    if (imgPanMove) { window.removeEventListener('mousemove', imgPanMove); imgPanMove = null; }
+    if (imgPanEnd) { window.removeEventListener('mouseup', imgPanEnd); imgPanEnd = null; }
   }
 
   function toggleFullscreen() {
@@ -425,7 +445,23 @@ const Viewer = (function () {
     if (delta === 0) { state.zoom = 1; state.pan = { x: 0, y: 0, dragging: false }; }
     else state.zoom = Math.min(6, Math.max(0.2, state.zoom + delta));
     updateZoomPct();
-    applyImageTransform();
+    applyContentZoom();
+  }
+  // Dispatches the zoom-percent change to whichever content element the
+  // current category actually renders. Previously this always called
+  // applyImageTransform() regardless of category — harmless for images
+  // (the only category the function actually knows about), but a real,
+  // silent no-op for word/text: their zoom +/- buttons updated the
+  // percentage label yet visibly did nothing, because
+  // applyImageTransform() only ever touches #dv-image-el, which doesn't
+  // exist outside the image viewer. Found during Phase 4's viewer audit
+  // (checking that every capability a format's toolbar advertises is
+  // actually wired up), not a pre-existing known/documented limitation.
+  function applyContentZoom() {
+    if (state.category === 'image') { applyImageTransform(); return; }
+    if (state.category === 'word') { applyDocZoom(); return; }
+    const pre = dom.content.querySelector('#dv-text-pre');
+    if (pre) pre.style.fontSize = (0.82 * state.zoom) + 'rem';
   }
 
   // ══════════════════════════════════════════════════════════
@@ -939,8 +975,6 @@ const Viewer = (function () {
     const el = dom.content.querySelector('#dv-office-doc');
     if (el) el.style.fontSize = (0.95 * state.zoom) + 'rem';
   }
-  // override generic zoomBy for doc/text zoom repaint
-  const _zoomByBase = zoomBy;
 
   // ══════════════════════════════════════════════════════════
   // EXCEL / CSV via SheetJS
@@ -1007,7 +1041,7 @@ const Viewer = (function () {
       pre.className = 'dv-text-pre';
       pre.id = 'dv-text-pre';
       pre.textContent = text;
-      pre.style.fontSize = '.82rem';
+      pre.style.fontSize = (0.82 * state.zoom) + 'rem';
       dom.content.appendChild(pre);
       state.searchTarget = pre;
       const lines = text.split('\n').length;
