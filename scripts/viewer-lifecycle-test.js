@@ -237,6 +237,40 @@ check('index.html loads js/viewers/pptx-viewer.js before js/viewer.js', () => {
   assert(engineIdx < shellIdx, 'js/viewers/pptx-viewer.js must be loaded before js/viewer.js');
 });
 
+// ══════════════════════════════════════════════════════════════════
+// Regression guards for the "Cannot read properties of undefined
+// (reading 'sizePt')" crash found in real-world manual testing (a real
+// PPTX where no run/paragraph anywhere specified an explicit font size —
+// extremely common, since PowerPoint usually resolves size from the
+// slide master's <p:txStyles> instead). Root cause was TWO things: (1)
+// `array.find(...) || {}` followed immediately by a second `.prop` read
+// — a bare `{}` fallback has no such property, so that pattern throws
+// instead of falling through; (2) the renderer never consulted
+// txStyles at all, so "no explicit size anywhere" was a common real
+// case, not a rare edge case.
+// ══════════════════════════════════════════════════════════════════
+
+check('pptx-viewer.js has no `.find(...) || {})` followed by a chained property read (the exact pattern that crashed as "Cannot read properties of undefined (reading \'sizePt\')")', () => {
+  const pptxEngineSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-viewer.js'), 'utf8');
+  assert(
+    !/\.find\([^)]*\)\s*\|\|\s*\{\}\)\s*\.[A-Za-z_$][\w$]*\s*\.[A-Za-z_$]/.test(pptxEngineSrc),
+    'found `.find(...) || {})` followed by a two-level property access — a bare {} fallback has no nested property; use an explicit ternary or optional chaining that handles the no-match case instead'
+  );
+});
+
+check('pptx-viewer.js resolves font size through real master <p:txStyles> inheritance, not just a flat guess (root-cause fix, not a defensive patch)', () => {
+  const pptxEngineSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-viewer.js'), 'utf8');
+  assert(/function parseTxStyles/.test(pptxEngineSrc), 'parseTxStyles() is missing — master-level <p:txStyles> font-size inheritance was removed');
+  assert(/function txStyleDefaultsFor/.test(pptxEngineSrc), 'txStyleDefaultsFor() is missing');
+  assert(/extractTextShape\(node, clrScheme, txStyles\)/.test(pptxEngineSrc), 'extractTextShape() is no longer called with txStyles — master-level font-size inheritance is disconnected from the render path');
+});
+
+check('pptx-viewer.js isolates a single bad slide or shape instead of letting it crash the whole presentation', () => {
+  const pptxEngineSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-viewer.js'), 'utf8');
+  assert(/catch \(shapeErr\)/.test(pptxEngineSrc), 'per-shape try/catch (catch (shapeErr)) is missing — one malformed shape could crash the whole slide again');
+  assert(/catch \(slideErr\)/.test(pptxEngineSrc), 'per-slide try/catch (catch (slideErr)) is missing — one malformed slide could crash the whole presentation again');
+});
+
 console.log('\n=== VIEWER LIFECYCLE / CAPABILITY REGRESSION RESULTS ===');
 let pass = 0;
 for (const [name, status] of results) {

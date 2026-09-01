@@ -326,6 +326,52 @@ const PptxViewer = (function () {
     return props;
   }
 
+  // ── master-level default text formatting (<p:txStyles>) ────────────
+  // THE ACTUAL ROOT CAUSE of the "Cannot read properties of undefined
+  // (reading 'sizePt')" crash: real-world PPTX text very often has NO
+  // explicit font size on the run, the paragraph's defRPr, or anywhere in
+  // the slide XML at all — PowerPoint resolves it from the slide MASTER's
+  // <p:txStyles> (<p:titleStyle>/<p:bodyStyle>/<p:otherStyle>, each with
+  // up to 9 outline-level <a:lvlNpPr><a:defRPr>) instead. The previous
+  // code never consulted this — it only ever looked at the run and the
+  // paragraph, then jumped straight to a flat 32pt/18pt guess — so any
+  // paragraph where NO run had a resolvable size crashed instead of
+  // falling through to that guess (Array.prototype.find() returning
+  // undefined, then reading .props off the {} fallback).
+  //
+  // Fixed properly, not just defensively: master txStyles are now a real
+  // inheritance layer (paragraph run > paragraph defRPr > master txStyles
+  // for this outline level > flat renderer default), which both matches
+  // what PowerPoint itself does AND — as a side effect of being null-safe
+  // by construction (every lookup here returns {} rather than throwing on
+  // a missing level/style block) — eliminates the crash class entirely
+  // rather than papering over the one line that happened to surface it.
+  function parseTxStyles(masterXdoc, clrScheme) {
+    const empty = { title: [], body: [], other: [] };
+    if (!masterXdoc) return empty;
+    const txStyles = masterXdoc.getElementsByTagName('p:txStyles')[0];
+    if (!txStyles) return empty;
+    function parseBlock(tagName) {
+      const block = txStyles.getElementsByTagName(tagName)[0];
+      const levels = [];
+      if (!block) return levels;
+      for (let lvl = 1; lvl <= 9; lvl++) {
+        const lvlEl = block.getElementsByTagName('a:lvl' + lvl + 'pPr')[0];
+        const defRPr = lvlEl && lvlEl.getElementsByTagName('a:defRPr')[0];
+        levels.push(getRunProps(defRPr, clrScheme)); // getRunProps already returns {} for a missing element
+      }
+      return levels;
+    }
+    return { title: parseBlock('p:titleStyle'), body: parseBlock('p:bodyStyle'), other: parseBlock('p:otherStyle') };
+  }
+  // Paragraph outline level (<a:pPr lvl="N">, 0-indexed) selects which
+  // txStyles level applies; a missing/out-of-range level or an entirely
+  // missing style block all safely resolve to {} (renderer default wins).
+  function txStyleDefaultsFor(txStyles, isTitle, lvl) {
+    const levels = isTitle ? txStyles.title : txStyles.body;
+    return (levels && levels[lvl]) || {};
+  }
+
   async function render(ctx) {
     const {
       fetchBytes, showLoading, showError, setInfoExtra, addSearchToggle, esc, dom, state,
@@ -355,15 +401,25 @@ const PptxViewer = (function () {
       const defaultSizePt = { title: 32, body: 18 };
       const inheritanceCache = { byLayout: {}, byTheme: {} };
 
-      function extractTextShape(sp, clrScheme) {
+      function extractTextShape(sp, clrScheme, txStyles) {
         const paras = Array.from(sp.getElementsByTagName('a:p'));
         const ph = sp.getElementsByTagName('p:ph')[0];
         const isTitle = !!(ph && /title|ctrTitle/i.test(ph.getAttribute('type') || ''));
         const lines = [];
         for (const p of paras) {
           const pPr = p.getElementsByTagName('a:pPr')[0];
+          const lvlAttr = pPr && pPr.getAttribute('lvl');
+          const lvl = lvlAttr ? Math.max(0, Math.min(8, parseInt(lvlAttr, 10) || 0)) : 0;
+          const masterDefaults = txStyleDefaultsFor(txStyles, isTitle, lvl);
           const defRPr = pPr && pPr.getElementsByTagName('a:defRPr')[0];
-          const paraDefaults = getRunProps(defRPr, clrScheme);
+          // Inheritance order (later wins): renderer fallback (applied
+          // below, only if sizePt is still missing after all of this) <
+          // master txStyles for this outline level < paragraph's own
+          // defRPr < the individual run's own rPr. Every step here is a
+          // plain object (never undefined), so composing them can never
+          // throw regardless of which levels are actually present in a
+          // given file.
+          const paraDefaults = Object.assign({}, masterDefaults, getRunProps(defRPr, clrScheme));
           const runs = Array.from(p.getElementsByTagName('a:r'));
           const spans = [];
           let lineText = '';
@@ -377,7 +433,14 @@ const PptxViewer = (function () {
             lineText += text;
           }
           if (!lineText.trim()) continue;
-          const sizePt = (spans.find(s => s.props.sizePt) || {}).props.sizePt || (isTitle ? defaultSizePt.title : defaultSizePt.body);
+          // If NO run in this paragraph resolved a size at any inheritance
+          // level (rare, but real — e.g. a master with no txStyles at
+          // all), fall back to the flat renderer default. find() returning
+          // undefined is handled explicitly rather than via `|| {}` — a
+          // bare {} has no .props and reading .props.sizePt off it is
+          // exactly what crashed before.
+          const sizedSpan = spans.find(s => s.props.sizePt);
+          const sizePt = sizedSpan ? sizedSpan.props.sizePt : (isTitle ? defaultSizePt.title : defaultSizePt.body);
           lines.push({
             spans, sizePt,
             rtl: paragraphIsRtl(p, lineText),
@@ -443,50 +506,71 @@ const PptxViewer = (function () {
 
       const slides = [];
       for (const slidePath of slideFiles) {
-        const xdoc = await loadXml(zip, slidePath);
-        const { clrScheme, layoutXdoc, masterXdoc } = await resolveSlideInheritance(zip, slidePath, inheritanceCache);
-        const relMap = await getRelsMap(zip, slidePath);
+        // A single bad/unusual slide (malformed XML, an OOXML structure
+        // this parser doesn't expect) must not take down the whole
+        // presentation — render it as a clearly-marked broken slide
+        // instead of aborting the entire render() call.
+        try {
+          const xdoc = await loadXml(zip, slidePath);
+          const { clrScheme, layoutXdoc, masterXdoc } = await resolveSlideInheritance(zip, slidePath, inheritanceCache);
+          const txStyles = parseTxStyles(masterXdoc, clrScheme);
+          const relMap = await getRelsMap(zip, slidePath);
 
-        const spTree = xdoc.getElementsByTagName('p:spTree')[0];
-        const topLevelShapes = spTree ? Array.from(spTree.children) : [];
-        const shapes = [];
-        let title = '';
-        for (const node of topLevelShapes) {
-          const tag = node.tagName;
-          if (tag === 'p:sp') {
-            const shape = extractTextShape(node, clrScheme);
-            if (shape) {
-              if (shape.isTitle && !title) title = shape.html.replace(/<[^>]+>/g, '');
-              shapes.push(shape);
-            }
-          } else if (tag === 'p:pic') {
-            const img = await extractImageShape(node, relMap);
-            if (img) shapes.push(img);
-          } else if (tag === 'p:graphicFrame') {
-            const table = extractTable(node, clrScheme);
-            if (table) shapes.push(table);
-          } else if (tag === 'p:grpSp') {
-            // Grouped shapes: nested transforms would need full group
-            // coordinate-space math to position exactly, which isn't
-            // worth the complexity for a preview — instead, resolve the
-            // group's own bounding box (its <p:grpSpPr><a:xfrm>) and stack
-            // its children's text inside it. Approximate, but every
-            // group's text still appears roughly where the group itself
-            // sits on the slide, rather than being silently dropped.
-            const groupPos = getXfrmPercent(node.getElementsByTagName('p:grpSpPr')[0], slideCx, slideCy);
-            const innerParas = Array.from(node.getElementsByTagName('a:p'));
-            const innerLines = innerParas
-              .map(p => Array.from(p.getElementsByTagName('a:t')).map(t => t.textContent).join(''))
-              .filter(t => t.trim());
-            if (innerLines.length) {
-              const html = innerLines.map(t => `<div class="dv-slide-line" data-pt="${defaultSizePt.body}"${looksArabicLine(t) ? ' dir="rtl"' : ''}>${esc(t)}</div>`).join('');
-              shapes.push({ kind: 'text', pos: groupPos, html, anchor: 'flex-start' });
+          const spTree = xdoc.getElementsByTagName('p:spTree')[0];
+          const topLevelShapes = spTree ? Array.from(spTree.children) : [];
+          const shapes = [];
+          let title = '';
+          for (const node of topLevelShapes) {
+            // Likewise, one malformed shape (unexpected nesting, an
+            // attribute this parser assumed would be numeric but isn't,
+            // etc.) must only drop that shape, not the slide it's on.
+            try {
+              const tag = node.tagName;
+              if (tag === 'p:sp') {
+                const shape = extractTextShape(node, clrScheme, txStyles);
+                if (shape) {
+                  if (shape.isTitle && !title) title = shape.html.replace(/<[^>]+>/g, '');
+                  shapes.push(shape);
+                }
+              } else if (tag === 'p:pic') {
+                const img = await extractImageShape(node, relMap);
+                if (img) shapes.push(img);
+              } else if (tag === 'p:graphicFrame') {
+                const table = extractTable(node, clrScheme);
+                if (table) shapes.push(table);
+              } else if (tag === 'p:grpSp') {
+                // Grouped shapes: nested transforms would need full group
+                // coordinate-space math to position exactly, which isn't
+                // worth the complexity for a preview — instead, resolve the
+                // group's own bounding box (its <p:grpSpPr><a:xfrm>) and stack
+                // its children's text inside it. Approximate, but every
+                // group's text still appears roughly where the group itself
+                // sits on the slide, rather than being silently dropped.
+                const groupPos = getXfrmPercent(node.getElementsByTagName('p:grpSpPr')[0], slideCx, slideCy);
+                const innerParas = Array.from(node.getElementsByTagName('a:p'));
+                const innerLines = innerParas
+                  .map(p => Array.from(p.getElementsByTagName('a:t')).map(t => t.textContent).join(''))
+                  .filter(t => t.trim());
+                if (innerLines.length) {
+                  const html = innerLines.map(t => `<div class="dv-slide-line" data-pt="${defaultSizePt.body}"${looksArabicLine(t) ? ' dir="rtl"' : ''}>${esc(t)}</div>`).join('');
+                  shapes.push({ kind: 'text', pos: groupPos, html, anchor: 'flex-start' });
+                }
+              }
+            } catch (shapeErr) {
+              console.warn('[pptx-viewer] skipped one unparsable shape on', slidePath, shapeErr);
             }
           }
-        }
 
-        const bg = resolveSlideBackground(xdoc, layoutXdoc, masterXdoc, clrScheme);
-        slides.push({ title, shapes, bg });
+          const bg = resolveSlideBackground(xdoc, layoutXdoc, masterXdoc, clrScheme);
+          slides.push({ title, shapes, bg });
+        } catch (slideErr) {
+          console.warn('[pptx-viewer] failed to render slide', slidePath, slideErr);
+          slides.push({
+            title: '', bg: null,
+            shapes: [{ kind: 'text', pos: null, anchor: 'center',
+              html: `<div class="dv-slide-line" data-pt="${defaultSizePt.body}">⚠ تعذّر عرض محتوى هذه الشريحة</div>` }],
+          });
+        }
       }
 
       // ── DOM scaffold ──
