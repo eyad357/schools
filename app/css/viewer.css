@@ -180,13 +180,21 @@ mark.dv-hit.dv-hit-current{ background:#ff6f00; color:#fff; }
 .dv-slide-thumb .dv-slide-thumb-num{ position:absolute; top:3px; inset-inline-end:5px; font-weight:800; color:var(--muted); font-size:.6rem; }
 .dv-slide-stage{ flex:1 1 auto; display:flex; align-items:center; justify-content:center; padding:26px; overflow:auto; }
 .dv-slide-canvas{
-  background:#fff; color:#1a2332; width:100%; max-width:860px; aspect-ratio:16/9; border-radius:6px; padding:34px 42px;
-  box-shadow:0 6px 30px rgba(0,0,0,.5); overflow:auto; display:flex; flex-direction:column; gap:10px;
+  background:#fff; color:#1a2332; width:100%; max-width:860px; border-radius:6px;
+  box-shadow:0 6px 30px rgba(0,0,0,.5); overflow:hidden; position:relative;
 }
-.dv-slide-canvas h3{ color:var(--primary); font-size:1.15rem; border-bottom:2px solid var(--accent); padding-bottom:8px; margin-bottom:6px; }
-.dv-slide-canvas ul{ padding-inline-start:22px; font-size:.85rem; line-height:1.7; }
-.dv-slide-canvas img{ max-width:100%; max-height:180px; object-fit:contain; align-self:center; }
-.dv-slide-empty-text{ color:var(--muted); font-size:.8rem; font-style:italic; }
+/* Each shape is positioned as a percentage of the slide canvas (see
+   getXfrmPercent() in viewer.js) so it lands roughly where it sits in the
+   real PowerPoint file, regardless of the canvas's actual rendered size. */
+.dv-slide-shape{ position:absolute; overflow:hidden; padding:2px 4px; box-sizing:border-box; }
+.dv-slide-shape-title{ font-weight:800; }
+.dv-slide-shape-title .dv-slide-line{ font-size:1.15rem; color:var(--primary); border-bottom:2px solid var(--accent); padding-bottom:6px; }
+.dv-slide-shape-image{ display:flex; align-items:center; justify-content:center; }
+.dv-slide-shape-image img{ max-width:100%; max-height:100%; object-fit:contain; }
+.dv-slide-line{ font-size:.8rem; line-height:1.5; }
+.dv-slide-table{ border-collapse:collapse; width:100%; height:100%; font-size:.72rem; }
+.dv-slide-table td{ border:1px solid #ccd3dc; padding:3px 6px; overflow:hidden; text-overflow:ellipsis; }
+.dv-slide-empty-text{ color:var(--muted); font-size:.8rem; font-style:italic; position:absolute; inset:0; display:flex; align-items:center; justify-content:center; }
 
 /* ── Media (video/audio) viewer ──────────────────────────── */
 .dv-media-wrap{ width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:18px; }

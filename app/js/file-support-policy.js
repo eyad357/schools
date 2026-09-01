@@ -98,6 +98,104 @@
 
   const MB = 1024 * 1024;
 
+  // ── Phase 3: universal intake bounds & policy tiers ──────────────────
+  // The single authoritative outer size ceiling for ANY upload, regardless
+  // of category — server/routes/files.js's raw-body size limit is derived
+  // from this constant rather than hardcoding its own number, so there is
+  // exactly one place that decides "how big can any single upload be."
+  // Per-category maxSizeBytes below (e.g. images at 25MB) are always ≤
+  // this value; this is the ceiling for everything else, including the
+  // new "unknown but safe" bucket and the newly-enabled archive category.
+  const MAX_UPLOAD_BYTES = 300 * MB;
+
+  // Applied to any extension NOT found in EXTENSIONS below and NOT on the
+  // DANGEROUS_EXTENSIONS deny-list — see classifyUpload()'s three-tier
+  // policy (KNOWN / UNKNOWN-SAFE / DANGEROUS) in FILE-SUPPORT-ARCHITECTURE
+  // and PHASE_3_EVIDENCE_INTAKE_ARCHITECTURE.md.
+  const DEFAULT_UNKNOWN_MAX_BYTES = 50 * MB;
+
+  // Extensions that are always rejected at the upload boundary, regardless
+  // of size or signature — executable/script/installer formats with no
+  // legitimate role as school-accreditation evidence, where accepting them
+  // would add real execution-adjacent risk for negligible product value.
+  // This is a deny-list, not an allow-list: everything NOT on this list
+  // and NOT already a known EXTENSIONS entry is still accepted as
+  // "unknown but safe" (see classifyUpload) — the product's default is
+  // permissive intake with a narrow, explicit set of exclusions, not the
+  // other way around. Never executed, inspected, or treated as code by
+  // this application even if some of the same extensions are already
+  // implicitly present on disk from some other source (e.g. the OS-drop
+  // path via the file watcher, which this list intentionally does NOT
+  // apply to — see FILE-SUPPORT-ARCHITECTURE-REPORT.md's existing "watcher
+  // never hides files" policy, unchanged by Phase 3).
+  const DANGEROUS_EXTENSIONS = new Set([
+    'exe', 'msi', 'bat', 'cmd', 'com', 'scr', 'pif', 'lnk',
+    'ps1', 'ps1xml', 'psc1', 'psd1', 'psm1',
+    'vbs', 'vbe', 'js', 'jse', 'ws', 'wsf', 'wsh', 'hta',
+    'jar', 'app', 'sh', 'bash', 'dll', 'sys', 'drv',
+    'cpl', 'gadget', 'msc', 'reg', 'msix', 'appx', 'apk', 'dmg',
+  ]);
+
+  // Windows reserved device names — case-insensitive, and reserved both
+  // bare ("CON") and with any extension ("CON.txt") per Windows' own
+  // rules. Checked against the filename's base (before the first dot).
+  const WINDOWS_RESERVED_NAMES = new Set([
+    'CON', 'PRN', 'AUX', 'NUL',
+    'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+    'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
+  ]);
+
+  // Characters Windows never allows in a filename, plus C0 control codes.
+  // eslint-disable-next-line no-control-regex
+  const RESERVED_CHARS_REGEX = /[\\/:*?"<>|\x00-\x1f]/;
+
+  // Practical filename length ceiling. Windows' classic MAX_PATH is 260
+  // characters for the FULL path (drive + directories + filename); this
+  // app's indicator folder names are themselves long (Arabic domain +
+  // standard + indicator segments routinely exceed 80–120 characters
+  // combined), so a generous-but-bounded filename-only cap of 150
+  // characters leaves realistic headroom for the full path to stay under
+  // 260 in the common case, without arbitrarily truncating a school's
+  // legitimately long, descriptive Arabic filenames. This does not
+  // guarantee every combination stays under 260 on every install
+  // location — see PHASE_3_EVIDENCE_INTAKE_ARCHITECTURE.md "Known
+  // Limitations" for the full discussion and the long-path-support
+  // recommendation for a future phase.
+  const MAX_FILENAME_LENGTH = 150;
+
+  /**
+   * Validates a filename against Windows/filesystem safety rules only —
+   * NOT extension/type policy (see classifyUpload for that). Used for
+   * both upload (new file arriving) and rename (existing file's new
+   * name), so both paths share exactly one definition of "a safe
+   * filename," instead of each maintaining its own ad-hoc checks.
+   * Returns { ok: true } or { ok: false, reason }.
+   */
+  function validateFilename(rawName) {
+    const name = String(rawName || '').trim();
+    if (!name || name === '.' || name === '..') {
+      return { ok: false, reason: 'INVALID_NAME' };
+    }
+    if (RESERVED_CHARS_REGEX.test(name)) {
+      return { ok: false, reason: 'INVALID_CHARS' };
+    }
+    if (name.length > MAX_FILENAME_LENGTH) {
+      return { ok: false, reason: 'NAME_TOO_LONG' };
+    }
+    if (/[. ]$/.test(name)) {
+      // Windows silently strips trailing dots/spaces at the OS level,
+      // which means the file that actually lands on disk would have a
+      // different name than what the user/UI thinks it saved as — reject
+      // explicitly instead of letting that silent mismatch happen.
+      return { ok: false, reason: 'TRAILING_DOT_OR_SPACE' };
+    }
+    const base = name.slice(0, name.indexOf('.') === -1 ? name.length : name.indexOf('.'));
+    if (WINDOWS_RESERVED_NAMES.has(base.toUpperCase())) {
+      return { ok: false, reason: 'RESERVED_NAME' };
+    }
+    return { ok: true };
+  }
+
   // ── THE table. One row per supported extension. ─────────────────────
   // upload.allowed=false means: reject at the upload boundary (HTTP
   // upload + drag&drop). It does NOT affect the filesystem watcher —
@@ -205,7 +303,28 @@
       contentExtraction: { supported: true }, thumbnail: { supported: false, engine: null },
       search: { supported: true }, ocr: { supported: false },
       displayNameAr: 'عرض PowerPoint', fallback: 'preview', signature: SIG.ZIP,
-      notes: 'Extracts slide titles/bullet text/embedded images from the raw OOXML. Does NOT reproduce slide layout, fonts, positioning, or animations — partial fidelity by design, not a bug.',
+      notes: 'Extracts slide titles/text/tables/images from the raw OOXML and approximates each shape\'s real on-slide position via its <a:xfrm> (percentage-based, so layout roughly matches the source). Does NOT reproduce real PowerPoint fonts, gradients/shadows/theme colors, animations, transitions, or embedded charts/SmartArt graphics — partial fidelity by design, not a bug.',
+    },
+    ppsx: {
+      // PowerPoint Show — the exact same OOXML/ZIP package format as
+      // .pptx (identical ppt/slides/slideN.xml internal structure; the
+      // only difference is a top-level content-type flag meaning "open
+      // directly into slideshow mode" rather than "open into edit mode").
+      // Found missing during Phase 4's audit while testing classification
+      // against the real sample evidence already committed in this repo —
+      // a real .ppsx file was silently falling into the generic "unknown
+      // but safe" bucket (Phase 3) with no preview at all, despite the
+      // existing pptx-text-extract engine already being fully capable of
+      // rendering it (it parses generic OOXML slide XML, format-identical
+      // between the two extensions — no viewer.js change was needed to
+      // support this, only this missing policy entry).
+      category: 'powerpoint', mimeTypes: ['application/vnd.openxmlformats-officedocument.presentationml.slideshow'],
+      upload: { allowed: true }, maxSizeBytes: 100 * MB,
+      preview: { supported: true, engine: 'pptx-text-extract', fidelity: 'partial' },
+      contentExtraction: { supported: true }, thumbnail: { supported: false, engine: null },
+      search: { supported: true }, ocr: { supported: false },
+      displayNameAr: 'عرض PowerPoint (شرائح)', fallback: 'preview', signature: SIG.ZIP,
+      notes: 'Same OOXML structure and same partial-fidelity caveat as .pptx above.',
     },
     ppt: {
       category: 'powerpoint', mimeTypes: ['application/vnd.ms-powerpoint'],
@@ -300,12 +419,12 @@
   }
   function archiveEntry(mimeTypes, signature) {
     return {
-      category: 'archive', mimeTypes, upload: { allowed: false }, maxSizeBytes: 0,
+      category: 'archive', mimeTypes, upload: { allowed: true }, maxSizeBytes: MAX_UPLOAD_BYTES,
       preview: { supported: false, engine: null, fidelity: 'none' },
       contentExtraction: { supported: false }, thumbnail: { supported: false, engine: null },
       search: { supported: false }, ocr: { supported: false },
       displayNameAr: 'أرشيف مضغوط', fallback: 'external-open', signature,
-      notes: 'Upload intentionally disabled: the app has no preview/extraction capability for archives, and accepting opaque compressed blobs into an accreditation-evidence store adds no product value while adding real risk (decompression bombs if ever unpacked, unreviewable content). Flip upload.allowed to re-enable if a future feature needs it.',
+      notes: 'Stored as an opaque evidence file — never automatically extracted, inspected, or unpacked by this application (Phase 3 policy: archives are accepted for universal intake, but decompression is a distinct, separately-secured capability that does not exist here). No internal preview; use "open externally" to inspect contents in the OS default archive tool.',
     };
   }
 
@@ -317,14 +436,18 @@
     return s.slice(i + 1).toLowerCase();
   }
 
-  function getPolicy(filenameOrExt) {
+  function resolveExt(filenameOrExt) {
     const raw = String(filenameOrExt || '');
     // If it looks like a bare extension (no dot, or a single leading dot
     // and nothing else — e.g. "pdf" or ".pdf"), use it directly. Otherwise
     // treat it as a filename and take the part after the last dot.
-    const ext = raw.indexOf('.') === -1
+    return raw.indexOf('.') === -1
       ? raw.toLowerCase()
       : (raw.lastIndexOf('.') === 0 ? raw.slice(1).toLowerCase() : getExtension(raw));
+  }
+
+  function getPolicy(filenameOrExt) {
+    const ext = resolveExt(filenameOrExt);
     return EXTENSIONS[ext] || null;
   }
 
@@ -337,9 +460,16 @@
     return CATEGORIES[category] || CATEGORIES.other;
   }
 
+  // Mirrors classifyUpload()'s three-tier policy (KNOWN / UNKNOWN-SAFE /
+  // DANGEROUS) for callers that just need a yes/no answer without a full
+  // classification result (e.g. client-side pre-upload UI checks) — must
+  // stay in sync with classifyUpload's actual decision, since that's the
+  // function server/routes/files.js authoritatively validates against.
   function isUploadAllowed(filenameOrExt) {
     const p = getPolicy(filenameOrExt);
-    return !!(p && p.upload.allowed);
+    if (p) return !!p.upload.allowed;
+    const ext = resolveExt(filenameOrExt);
+    return !DANGEROUS_EXTENSIONS.has(ext);
   }
 
   function isPreviewSupported(filenameOrExt) {
@@ -385,46 +515,150 @@
   // still runs on extension + size, just skips the magic-byte check.
   // Returns { ok, ext, category, policy, reason, friendlyTitle, friendlyDetail }.
   function classifyUpload({ filename, size, headerBytes }) {
+    const nameCheck = validateFilename(filename);
+    if (!nameCheck.ok) {
+      const messages = {
+        INVALID_NAME: 'اسم الملف غير صالح.',
+        INVALID_CHARS: 'اسم الملف يحتوي على رموز غير مسموح بها.',
+        NAME_TOO_LONG: `اسم الملف أطول من الحد المسموح (${MAX_FILENAME_LENGTH} حرفًا).`,
+        TRAILING_DOT_OR_SPACE: 'لا يمكن أن ينتهي اسم الملف بنقطة أو مسافة.',
+        RESERVED_NAME: 'اسم الملف محجوز من قبل نظام التشغيل ولا يمكن استخدامه.',
+      };
+      return {
+        ok: false, ext: getExtension(filename), category: 'other', policy: null, reason: 'INVALID_FILENAME',
+        friendlyTitle: 'اسم الملف غير صالح',
+        friendlyDetail: messages[nameCheck.reason] || 'اسم الملف غير صالح.',
+      };
+    }
+
+    if (typeof size === 'number' && size <= 0) {
+      return {
+        ok: false, ext: getExtension(filename), category: 'other', policy: null, reason: 'EMPTY_FILE',
+        friendlyTitle: 'الملف فارغ',
+        friendlyDetail: 'لا يمكن رفع ملف فارغ (0 بايت) كدليل.',
+      };
+    }
+
     const ext = getExtension(filename);
     const policy = EXTENSIONS[ext];
 
-    if (!policy) {
-      return {
-        ok: false, ext, category: 'other', policy: null, reason: 'UNSUPPORTED_TYPE',
-        friendlyTitle: 'نوع الملف غير مدعوم',
-        friendlyDetail: `الامتداد "${ext || '(بدون امتداد)'}" غير مدعوم حاليًا. الصيغ المدعومة: ${allowedExtensionsList().map((e) => '.' + e).join('، ')}.`,
-      };
-    }
-    if (!policy.upload.allowed) {
-      return {
-        ok: false, ext, category: policy.category, policy, reason: 'TYPE_BLOCKED',
-        friendlyTitle: 'هذا النوع من الملفات غير مسموح برفعه',
-        friendlyDetail: policy.notes || 'هذا التنسيق غير مسموح به ضمن سياسة الملفات الحالية.',
-      };
-    }
-    if (typeof size === 'number' && size > policy.maxSizeBytes) {
-      return {
-        ok: false, ext, category: policy.category, policy, reason: 'TOO_LARGE',
-        friendlyTitle: 'حجم الملف أكبر من المسموح',
-        friendlyDetail: `الحد الأقصى لملفات ${policy.displayNameAr} هو ${Math.round(policy.maxSizeBytes / MB)} ميجابايت.`,
-      };
-    }
-    if (headerBytes) {
-      const sigCheck = checkMagicBytes(ext, headerBytes);
-      if (sigCheck.checked && !sigCheck.matched && !sigCheck.soft) {
+    // ── Tier 1: known extension — existing per-type policy applies. ──
+    if (policy) {
+      if (!policy.upload.allowed) {
         return {
-          ok: false, ext, category: policy.category, policy, reason: 'SIGNATURE_MISMATCH',
-          friendlyTitle: 'محتوى الملف لا يطابق امتداده',
-          friendlyDetail: `الملف يحمل امتداد .${ext} لكن محتواه الفعلي لا يبدو ملفًا من هذا النوع. تأكد من أن الملف سليم وغير تالف.`,
+          ok: false, ext, category: policy.category, policy, reason: 'TYPE_BLOCKED',
+          friendlyTitle: 'هذا النوع من الملفات غير مسموح برفعه',
+          friendlyDetail: policy.notes || 'هذا التنسيق غير مسموح به ضمن سياسة الملفات الحالية.',
         };
       }
+      if (typeof size === 'number' && size > policy.maxSizeBytes) {
+        return {
+          ok: false, ext, category: policy.category, policy, reason: 'TOO_LARGE',
+          friendlyTitle: 'حجم الملف أكبر من المسموح',
+          friendlyDetail: `الحد الأقصى لملفات ${policy.displayNameAr} هو ${Math.round(policy.maxSizeBytes / MB)} ميجابايت.`,
+        };
+      }
+      if (headerBytes) {
+        const sigCheck = checkMagicBytes(ext, headerBytes);
+        if (sigCheck.checked && !sigCheck.matched && !sigCheck.soft) {
+          return {
+            ok: false, ext, category: policy.category, policy, reason: 'SIGNATURE_MISMATCH',
+            friendlyTitle: 'محتوى الملف لا يطابق امتداده',
+            friendlyDetail: `الملف يحمل امتداد .${ext} لكن محتواه الفعلي لا يبدو ملفًا من هذا النوع. تأكد من أن الملف سليم وغير تالف.`,
+          };
+        }
+      }
+      return { ok: true, ext, category: policy.category, policy };
     }
-    return { ok: true, ext, category: policy.category, policy };
+
+    // ── Tier 2: unrecognized extension, but explicitly dangerous — deny. ──
+    if (DANGEROUS_EXTENSIONS.has(ext)) {
+      return {
+        ok: false, ext, category: 'other', policy: null, reason: 'DANGEROUS_TYPE',
+        friendlyTitle: 'هذا النوع من الملفات غير مسموح به لأسباب أمنية',
+        friendlyDetail: `الامتداد ".${ext}" يمثل ملفًا تنفيذيًا أو نصًا برمجيًا ولا يُسمح برفعه كدليل اعتماد مدرسي.`,
+      };
+    }
+
+    // ── Tier 3: unrecognized but not dangerous — accept as "unknown but
+    //    safe" evidence. Uploadable and storable; no internal preview
+    //    (nothing in the viewer knows this format), external-open only.
+    //    This is the core of Phase 3's "universal intake" requirement —
+    //    the app must not reject legitimate evidence merely because its
+    //    format wasn't anticipated when EXTENSIONS was written. ──
+    if (typeof size === 'number' && size > DEFAULT_UNKNOWN_MAX_BYTES) {
+      return {
+        ok: false, ext, category: 'other', policy: null, reason: 'TOO_LARGE',
+        friendlyTitle: 'حجم الملف أكبر من المسموح',
+        friendlyDetail: `الحد الأقصى للملفات من هذا النوع غير المعروف هو ${Math.round(DEFAULT_UNKNOWN_MAX_BYTES / MB)} ميجابايت. إذا كان هذا النوع من الملفات شائعًا لديكم، يمكن إضافته رسميًا إلى قائمة الأنواع المدعومة.`,
+      };
+    }
+    return {
+      ok: true, ext, category: 'other',
+      policy: {
+        category: 'other', mimeTypes: [], upload: { allowed: true }, maxSizeBytes: DEFAULT_UNKNOWN_MAX_BYTES,
+        preview: { supported: false, engine: null, fidelity: 'none' },
+        contentExtraction: { supported: false }, thumbnail: { supported: false, engine: null },
+        search: { supported: false }, ocr: { supported: false },
+        displayNameAr: ext ? `ملف .${ext}` : 'ملف بدون امتداد', fallback: 'external-open', signature: null,
+      },
+    };
+  }
+
+  // ── Phase 4: viewer capability model ─────────────────────────────────
+  // Capabilities are a property of the PREVIEW ENGINE, not the extension
+  // (every .pdf/.xlsx/etc. that shares an engine gets the exact same
+  // capability set) — this deliberately mirrors app/js/viewer.js's own
+  // `renderersByEngine` dispatch table, keyed by the same engine names,
+  // so the two stay mechanically checkable against each other (see
+  // scripts/viewer-lifecycle-test.js's "capabilities match reality"
+  // check) instead of silently drifting apart the way the pre-Phase-0
+  // per-format tables once did (see FILE-SUPPORT-ARCHITECTURE-REPORT.md).
+  //
+  // Every flag below reflects what the CURRENT viewer.js render function
+  // for that engine actually wires up (verified by reading each function
+  // during the Phase 4 audit — see PHASE_4_VIEWER_AUDIT.md) — not an
+  // aspirational or planned capability. A capability appears here if and
+  // only if a real toolbar control/keyboard shortcut for it exists today.
+  const VIEWER_CAPABILITIES_BY_ENGINE = {
+    'pdfjs': { zoom: true, fitWidth: true, fitPage: true, pageNavigation: true, thumbnails: true, rotate: true, search: true, print: true, fullscreen: true },
+    'mammoth': { zoom: true, search: true, fullscreen: true },
+    'sheetjs': { sheetNavigation: true, search: true, fullscreen: true },
+    'pptx-text-extract': { slideNavigation: true, search: true, fullscreen: true },
+    'native-image': { zoom: true, pan: true, rotate: true, gallery: true, fullscreen: true },
+    'native-media-video': { playback: true, seek: true, volume: true, playbackSpeed: true, fullscreen: true },
+    'native-media-audio': { playback: true, seek: true, volume: true, playbackSpeed: true },
+    'plaintext': { zoom: true, search: true, fullscreen: true },
+  };
+  const NO_CAPABILITIES = Object.freeze({});
+
+  /**
+   * Given a filename/extension, returns the capability flags its preview
+   * (if any) actually supports — e.g. { zoom:true, pageNavigation:true,
+   * search:true, ... } for a PDF, or an empty object for a type with no
+   * internal preview (external-open/fallback types, and the Phase 3
+   * "unknown but safe" tier, none of which render any format-specific
+   * toolbar controls). This is the data half of Phase 4's viewer-resolver
+   * concept — app/js/viewer.js's `renderersByEngine` table remains the
+   * single place that actually DOES the rendering; this function only
+   * describes what that rendering, once it happens, will let the user do.
+   */
+  function getViewerCapabilities(filenameOrExt) {
+    const p = getPolicy(filenameOrExt);
+    if (!p || !p.preview.supported || !p.preview.engine) return NO_CAPABILITIES;
+    return VIEWER_CAPABILITIES_BY_ENGINE[p.preview.engine] || NO_CAPABILITIES;
   }
 
   return {
     EXTENSIONS,
     CATEGORIES,
+    DANGEROUS_EXTENSIONS,
+    WINDOWS_RESERVED_NAMES,
+    MAX_UPLOAD_BYTES,
+    DEFAULT_UNKNOWN_MAX_BYTES,
+    MAX_FILENAME_LENGTH,
+    VIEWER_CAPABILITIES_BY_ENGINE,
+    validateFilename,
     getExtension,
     getPolicy,
     getCategory,
@@ -437,5 +671,6 @@
     allowedExtensionsList,
     checkMagicBytes,
     classifyUpload,
+    getViewerCapabilities,
   };
 });

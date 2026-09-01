@@ -6,12 +6,39 @@ const path = require('path');
 const router = express.Router();
 const evidenceService = require('../services/evidenceService');
 const FileSupportPolicy = require('../../app/js/file-support-policy.js');
+const log = require('../../electron/utils/logger');
 
-const rawBody = express.raw({ type: '*/*', limit: '200mb' });
+const rawBody = express.raw({ type: '*/*', limit: Math.ceil(FileSupportPolicy.MAX_UPLOAD_BYTES / (1024 * 1024)) + 'mb' });
 
 function decodeFilename(headerVal, fallback) {
   if (!headerVal) return fallback;
   try { return decodeURIComponent(headerVal); } catch { return fallback; }
+}
+
+// Maps a raw Node filesystem error to a structured, user-safe response.
+// Never echoes err.message/err.stack to the client — Node's fs error
+// messages routinely include the full absolute path being operated on,
+// which is an internal implementation detail (and, on a school's
+// machine, potentially a path containing a staff member's Windows
+// username) that has no business reaching the UI. The raw error is
+// still logged server-side (electron-log, same logger used everywhere
+// else in this app) for developers/support to actually diagnose the
+// problem — see Phase 3 "Error Handling".
+function classifyStorageError(err, context) {
+  log.error(`[evidence-intake] ${context} failed:`, err);
+  switch (err && err.code) {
+    case 'ENOSPC':
+      return { status: 500, reason: 'STORAGE_ERROR', message: 'لا توجد مساحة تخزين كافية على القرص لحفظ الملف.' };
+    case 'EACCES':
+    case 'EPERM':
+      return { status: 500, reason: 'PERMISSION_DENIED', message: 'تم رفض الإذن للكتابة في مجلد الشواهد. تحقق من صلاحيات المجلد.' };
+    case 'EROFS':
+      return { status: 500, reason: 'PERMISSION_DENIED', message: 'مجلد الشواهد للقراءة فقط حاليًا ولا يمكن الكتابة إليه.' };
+    case 'ENOENT':
+      return { status: 500, reason: 'STORAGE_ERROR', message: 'تعذر الوصول إلى مسار التخزين المطلوب.' };
+    default:
+      return { status: 500, reason: 'UNKNOWN_ERROR', message: 'حدث خطأ غير متوقع أثناء العملية. حاول مرة أخرى.' };
+  }
 }
 
 // GET /api/files/:code
@@ -33,7 +60,15 @@ router.get('/file/:code/:name', async (req, res) => {
 router.delete('/file/:code/:name', async (req, res) => {
   const { evidenceRoot, store } = req.app.locals;
   const result = await evidenceService.deleteEvidenceFile(evidenceRoot, req.params.code, req.params.name);
-  if (!result.ok) return res.status(404).json({ error: 'الملف غير موجود' });
+  if (!result.ok) {
+    // NOT_A_FILE: the resolved target is a directory (structural, part of
+    // the immutable standards hierarchy), not evidence — see Phase 2's
+    // "Read-Only Contract". Reported as 404 too, same as NOT_FOUND: from
+    // the API consumer's point of view both mean "no such evidence file",
+    // and the app's UI never lists directories as deletable files in the
+    // first place, so this branch is only reachable via a crafted request.
+    return res.status(404).json({ error: 'الملف غير موجود' });
+  }
   store.addAudit({ action: 'file_deleted', target: req.params.name, indicator: req.params.code, details: 'حُذف من داخل التطبيق' });
   res.json({ success: true });
 });
@@ -64,7 +99,12 @@ async function handleUpload(req, res) {
       action: 'file_upload_rejected', target: filename, indicator: code,
       details: `${verdict.reason}: ${verdict.friendlyDetail}`,
     });
-    return res.status(415).json({
+    // INVALID_FILENAME/EMPTY_FILE are request-shape problems (400); every
+    // other rejection reason (TYPE_BLOCKED/DANGEROUS_TYPE/TOO_LARGE/
+    // SIGNATURE_MISMATCH) is "the file itself isn't acceptable" (415),
+    // matching the existing convention for type/size/signature rejections.
+    const status = (verdict.reason === 'INVALID_FILENAME' || verdict.reason === 'EMPTY_FILE') ? 400 : 415;
+    return res.status(status).json({
       error: verdict.friendlyTitle,
       detail: verdict.friendlyDetail,
       reason: verdict.reason,
@@ -74,11 +114,15 @@ async function handleUpload(req, res) {
   }
 
   try {
-    evidenceService.writeEvidenceFile(dir, filename, body);
-    store.addAudit({ action: 'file_uploaded', target: filename, indicator: code });
-    res.json({ success: true, filename });
+    const result = evidenceService.writeEvidenceFile(dir, filename, body);
+    store.addAudit({
+      action: 'file_uploaded', target: result.filename, indicator: code,
+      details: result.filename === filename ? undefined : `الاسم الأصلي: ${filename} — أُعيد تسميته تلقائيًا لتفادي استبدال ملف موجود`,
+    });
+    res.json({ success: true, filename: result.filename, originalFilename: filename, size: result.size, sha256: result.sha256 });
   } catch (err) {
-    res.status(500).json({ error: 'فشل حفظ الملف: ' + err.message });
+    const classified = classifyStorageError(err, `upload to indicator ${code}`);
+    res.status(classified.status).json({ error: classified.message, reason: classified.reason });
   }
 }
 
@@ -128,7 +172,8 @@ router.patch('/file/:code/rename', async (req, res) => {
   try {
     result = evidenceService.renameEvidenceFile(evidenceRoot, req.params.code, oldName, newName);
   } catch (err) {
-    return res.status(500).json({ error: 'فشلت إعادة التسمية: ' + err.message });
+    const classified = classifyStorageError(err, `rename in indicator ${req.params.code}`);
+    return res.status(classified.status).json({ error: classified.message, reason: classified.reason });
   }
 
   if (!result.ok) {
@@ -136,8 +181,18 @@ router.patch('/file/:code/rename', async (req, res) => {
       case 'UNKNOWN_INDICATOR': return res.status(400).json({ error: 'مؤشر غير معروف' });
       case 'INVALID_NAME': return res.status(400).json({ error: 'اسم الملف الجديد غير صالح' });
       case 'INVALID_CHARS': return res.status(400).json({ error: 'اسم الملف يحتوي على رموز غير مسموح بها' });
+      case 'NAME_TOO_LONG': return res.status(400).json({ error: `اسم الملف أطول من الحد المسموح (${FileSupportPolicy.MAX_FILENAME_LENGTH} حرفًا)` });
+      case 'TRAILING_DOT_OR_SPACE': return res.status(400).json({ error: 'لا يمكن أن ينتهي اسم الملف بنقطة أو مسافة' });
+      case 'RESERVED_NAME': return res.status(400).json({ error: 'اسم الملف محجوز من قبل نظام التشغيل ولا يمكن استخدامه' });
       case 'INVALID_PATH': return res.status(400).json({ error: 'مسار غير صالح' });
       case 'SOURCE_NOT_FOUND': return res.status(404).json({ error: 'الملف الأصلي غير موجود' });
+      // NOT_A_FILE: the resolved source is a directory (structural, part
+      // of the immutable standards hierarchy), not evidence — see Phase
+      // 2's "Read-Only Contract". Reported as 404 too, same as
+      // SOURCE_NOT_FOUND: the app's UI never lists directories as
+      // renameable files, so this branch is only reachable via a crafted
+      // request, same reasoning as the DELETE endpoint above.
+      case 'NOT_A_FILE': return res.status(404).json({ error: 'الملف الأصلي غير موجود' });
       case 'DUPLICATE': return res.status(409).json({ error: `يوجد ملف آخر بهذا الاسم بالفعل: ${result.filename}` });
       /* istanbul ignore next — no known code path returns an unlisted reason */
       default: return res.status(500).json({ error: 'فشلت إعادة التسمية' });

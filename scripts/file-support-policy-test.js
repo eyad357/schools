@@ -94,15 +94,31 @@ const FileSupportPolicy = require('../app/js/file-support-policy.js');
       if (!FileSupportPolicy.isUploadAllowed('file.' + ext)) throw new Error('expected allowed');
     });
   }
-  const expectedBlocked = ['zip', 'rar', '7z', 'tar', 'gz'];
-  for (const ext of expectedBlocked) {
-    await check(`policy: .${ext} is upload-blocked (archives)`, async () => {
+  // Superseded by the Phase 3 "universal intake" policy (see
+  // file-support-policy.js's classifyUpload three-tier model and
+  // scripts/evidence-intake-test.js, which is the authoritative suite for
+  // this behavior): archives are a known category with upload.allowed=true
+  // (stored opaquely, never auto-extracted — see DANGEROUS_EXTENSIONS for
+  // what's actually excluded), and a merely-unrecognized-but-not-dangerous
+  // extension is accepted into the "other" category rather than rejected,
+  // so a school's legitimate evidence in a format nobody anticipated isn't
+  // silently refused. Only the explicit executable/script deny-list
+  // (DANGEROUS_EXTENSIONS) is blocked — verified below.
+  const expectedAccepted = ['zip', 'rar', '7z', 'tar', 'gz'];
+  for (const ext of expectedAccepted) {
+    await check(`policy: .${ext} is upload-allowed (archives, stored opaquely)`, async () => {
+      if (!FileSupportPolicy.isUploadAllowed('file.' + ext)) throw new Error('expected allowed');
+    });
+  }
+  await check('policy: unrecognized-but-safe extension is upload-allowed ("other" category)', async () => {
+    if (!FileSupportPolicy.isUploadAllowed('file.xyzabc')) throw new Error('expected allowed');
+  });
+  const expectedDangerous = ['exe', 'bat', 'cmd', 'ps1', 'vbs', 'jar', 'dll', 'msi'];
+  for (const ext of expectedDangerous) {
+    await check(`policy: .${ext} is upload-blocked (dangerous deny-list)`, async () => {
       if (FileSupportPolicy.isUploadAllowed('file.' + ext)) throw new Error('expected blocked');
     });
   }
-  await check('policy: unknown extension is upload-blocked', async () => {
-    if (FileSupportPolicy.isUploadAllowed('file.xyzabc')) throw new Error('expected blocked');
-  });
 
   const previewMatrix = {
     pdf: true, docx: true, doc: false, pptx: true, ppt: false,
@@ -186,14 +202,19 @@ const FileSupportPolicy = require('../app/js/file-support-policy.js');
     if (!body.error || !body.allowedExtensions) throw new Error('expected a friendly error body with allowedExtensions');
   });
 
-  await check('upload: a .zip is rejected (archives disabled)', async () => {
-    const r = await uploadRaw('bundle.zip', Buffer.from([0x50, 0x4b, 0x03, 0x04]), 'application/zip');
-    if (r.status !== 415) throw new Error('expected 415, got ' + r.status);
+  await check('upload: a well-formed .zip is accepted (universal intake, stored opaquely)', async () => {
+    // Minimal valid local-file-header + end-of-central-directory so the
+    // magic-byte/signature check (not just the extension policy) also
+    // passes — matches the real bundle.zip fixture in evidence-intake-test.js.
+    const eocd = Buffer.from([0x50, 0x4b, 0x05, 0x06, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]);
+    const zipBytes = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), eocd]);
+    const r = await uploadRaw('bundle.zip', zipBytes, 'application/zip');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
   });
 
-  await check('upload: an unknown extension is rejected', async () => {
+  await check('upload: an unrecognized-but-safe extension is accepted', async () => {
     const r = await uploadRaw('mystery.xyzabc', Buffer.from('???'), 'application/octet-stream');
-    if (r.status !== 415) throw new Error('expected 415, got ' + r.status);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
   });
 
   await check('upload: a file named .pdf but containing plain text is rejected (spoofed extension)', async () => {
