@@ -23,20 +23,14 @@ const Viewer = (function () {
   function extOf(name) { return FileSupportPolicy.getExtension(name); }
   function categoryOf(name) { return FileSupportPolicy.getCategory(name); }
 
-  // Resolves an OOXML relationship Target (e.g. "../media/image1.png") against
-  // the directory of the file that referenced it (e.g. "ppt/slides"), the way
-  // a real zip/relative-path resolver would — simple string concatenation
-  // breaks on the leading "../" that PowerPoint always uses for media refs.
-  function resolveOoxmlPath(baseDir, target) {
-    const baseParts = baseDir.split('/').filter(Boolean);
-    const targetParts = target.split('/').filter(Boolean);
-    for (const part of targetParts) {
-      if (part === '..') baseParts.pop();
-      else if (part === '.') continue;
-      else baseParts.push(part);
-    }
-    return baseParts.join('/');
-  }
+  // ── PPTX layout-approximation logic now lives in its own specialized
+  // engine, app/js/viewers/pptx-viewer.js (Phase 7.5 shell/engine split —
+  // see that file's header comment for the ctx contract). renderPptx()
+  // below is the shell-side adapter: it stays in the renderersByEngine
+  // table under the same name so the dispatch table and the existing
+  // regression guards (scripts/viewer-lifecycle-test.js) keep working
+  // unchanged, but the actual OOXML parsing/positioning logic is no
+  // longer duplicated here.
 
   function fmtBytes(n) {
     if (n == null) return '—';
@@ -249,9 +243,29 @@ const Viewer = (function () {
     if (state.pdfDoc && typeof PDFEngine !== 'undefined') PDFEngine.destroyDocument(state.pdfDoc);
     else if (state.pdfDoc) { try { state.pdfDoc.destroy(); } catch {} }
     state.pdfDoc = null;
+    // PDF's two IntersectionObservers (lazy page rendering + current-page
+    // tracking) were previously only ever disconnected at the START of
+    // the NEXT renderAllPdfPages() call — i.e. only when re-viewing
+    // another PDF. Closing the viewer entirely, or switching to a
+    // non-PDF file, left both observers (and their closures over the
+    // old document's `wraps`/page objects) alive and registered
+    // indefinitely. Fixed here so every viewer-closing path (not just
+    // "open another PDF") tears them down, matching the same pattern
+    // already used for pdfDoc/objectUrls/mediaCleanup right above and
+    // below.
+    if (pdfObserver) { pdfObserver.disconnect(); pdfObserver = null; }
+    if (pdfPageTracker) { pdfPageTracker.disconnect(); pdfPageTracker = null; }
     if (state.mediaCleanup) { try { state.mediaCleanup(); } catch {} }
     const v = dom && dom.content.querySelector('video, audio');
     if (v) { try { v.pause(); v.src = ''; v.load(); } catch {} }
+    // Same class of gap as the PDF observers above: the image viewer's
+    // pan (drag-to-move) listeners live on `window` (needed so dragging
+    // still tracks the mouse outside the image element) and were
+    // previously only removed right before the NEXT image render, not on
+    // close/switch-away. Bounded (never more than one stale pair at a
+    // time) but real, and unnecessary — remove them on every cleanup.
+    if (imgPanMove) { window.removeEventListener('mousemove', imgPanMove); imgPanMove = null; }
+    if (imgPanEnd) { window.removeEventListener('mouseup', imgPanEnd); imgPanEnd = null; }
   }
 
   function toggleFullscreen() {
@@ -425,7 +439,21 @@ const Viewer = (function () {
     if (delta === 0) { state.zoom = 1; state.pan = { x: 0, y: 0, dragging: false }; }
     else state.zoom = Math.min(6, Math.max(0.2, state.zoom + delta));
     updateZoomPct();
-    applyImageTransform();
+    applyContentZoom();
+  }
+  // Dispatches the zoom-percent change to whichever content element the
+  // current category actually renders. Previously this always called
+  // applyImageTransform() regardless of category — harmless for images
+  // (the only category the function actually knows about), but a real,
+  // silent no-op for word/text: their zoom +/- buttons updated the
+  // percentage label yet visibly did nothing, because
+  // applyImageTransform() only ever touches #dv-image-el, which doesn't
+  // exist outside the image viewer.
+  function applyContentZoom() {
+    if (state.category === 'image') { applyImageTransform(); return; }
+    if (state.category === 'word') { applyDocZoom(); return; }
+    const pre = dom.content.querySelector('#dv-text-pre');
+    if (pre) pre.style.fontSize = (0.82 * state.zoom) + 'rem';
   }
 
   // ══════════════════════════════════════════════════════════
@@ -939,8 +967,6 @@ const Viewer = (function () {
     const el = dom.content.querySelector('#dv-office-doc');
     if (el) el.style.fontSize = (0.95 * state.zoom) + 'rem';
   }
-  // override generic zoomBy for doc/text zoom repaint
-  const _zoomByBase = zoomBy;
 
   // ══════════════════════════════════════════════════════════
   // EXCEL / CSV via SheetJS
@@ -1007,7 +1033,7 @@ const Viewer = (function () {
       pre.className = 'dv-text-pre';
       pre.id = 'dv-text-pre';
       pre.textContent = text;
-      pre.style.fontSize = '.82rem';
+      pre.style.fontSize = (0.82 * state.zoom) + 'rem';
       dom.content.appendChild(pre);
       state.searchTarget = pre;
       const lines = text.split('\n').length;
@@ -1019,107 +1045,16 @@ const Viewer = (function () {
   }
 
   // ══════════════════════════════════════════════════════════
-  // PPTX — best-effort client-side slide renderer via JSZip
-  // (extracts titles / bullet text / images per slide; this is a
-  // content preview, not a pixel-accurate layout renderer, since no
-  // real PowerPoint rendering engine is available client-side.)
+  // PPTX — thin shell-side adapter. The actual OOXML slide-layout
+  // parsing lives in the specialized engine app/js/viewers/pptx-viewer.js
+  // (Phase 7.5 shell/engine split). This function stays in
+  // renderersByEngine under its original name purely so the dispatch
+  // table and existing regression guards don't need to change; all it
+  // does is build the small ctx contract that engine expects and hand
+  // off to it.
   // ══════════════════════════════════════════════════════════
-  async function renderPptx() {
-    showLoading('جارٍ تحليل عرض PowerPoint…');
-    if (typeof JSZip === 'undefined') { showError('تعذّر تحميل عارض العروض', 'مكوّن العرض غير متاح.'); return; }
-    try {
-      const buf = await fetchBytes();
-      const zip = await JSZip.loadAsync(buf);
-      const slideFiles = Object.keys(zip.files)
-        .filter(p => /^ppt\/slides\/slide\d+\.xml$/.test(p))
-        .sort((a, b) => {
-          const na = parseInt(a.match(/slide(\d+)\.xml/)[1], 10);
-          const nb = parseInt(b.match(/slide(\d+)\.xml/)[1], 10);
-          return na - nb;
-        });
-      if (!slideFiles.length) throw new Error('no slides found');
-
-      const parser = new DOMParser();
-      const slides = [];
-      for (const path of slideFiles) {
-        const xmlText = await zip.file(path).async('text');
-        const xdoc = parser.parseFromString(xmlText, 'application/xml');
-        const shapes = Array.from(xdoc.getElementsByTagName('p:sp'));
-        let title = '', bullets = [];
-        shapes.forEach(sp => {
-          const ph = sp.getElementsByTagName('p:ph')[0];
-          const isTitle = ph && /title/i.test(ph.getAttribute('type') || '');
-          const paras = Array.from(sp.getElementsByTagName('a:p'));
-          paras.forEach(p => {
-            const runs = Array.from(p.getElementsByTagName('a:t')).map(t => t.textContent).join('');
-            if (!runs.trim()) return;
-            if (isTitle && !title) title = runs;
-            else bullets.push(runs);
-          });
-        });
-        // images: map r:embed -> media file via slide rels
-        const images = [];
-        const relsPath = path.replace('slides/slide', 'slides/_rels/slide') + '.rels';
-        const relsFile = zip.file(relsPath);
-        let relMap = {};
-        if (relsFile) {
-          const relsXml = parser.parseFromString(await relsFile.async('text'), 'application/xml');
-          Array.from(relsXml.getElementsByTagName('Relationship')).forEach(r => {
-            relMap[r.getAttribute('Id')] = r.getAttribute('Target');
-          });
-        }
-        const blips = Array.from(xdoc.getElementsByTagName('a:blip'));
-        for (const b of blips) {
-          const rId = b.getAttribute('r:embed');
-          const target = rId && relMap[rId];
-          if (!target) continue;
-          const mediaPath = resolveOoxmlPath('ppt/slides', target);
-          const mf = zip.file(mediaPath);
-          if (mf) {
-            const base64 = await mf.async('base64');
-            const ext = mediaPath.split('.').pop().toLowerCase();
-            const mime = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp' }[ext] || 'image/png';
-            images.push(`data:${mime};base64,${base64}`);
-          }
-        }
-        slides.push({ title, bullets, images });
-      }
-
-      dom.content.className = 'dv-content dv-content-flush';
-      dom.content.innerHTML = `<div class="dv-slides-wrap">
-        <div class="dv-slides-rail" id="dv-slides-rail"></div>
-        <div class="dv-slide-stage" id="dv-slide-stage"></div>
-      </div>`;
-      const rail = dom.content.querySelector('#dv-slides-rail');
-      const stage = dom.content.querySelector('#dv-slide-stage');
-      setInfoExtra(`<div class="dv-info-row"><span class="k">عدد الشرائح</span><span class="v">${slides.length}</span></div>
-        <div class="dv-info-row"><span class="k">ملاحظة</span><span class="v" style="font-size:.68rem;font-weight:500">معاينة للمحتوى النصي والصور — وليست عرضًا مطابقًا للتصميم الأصلي</span></div>`);
-      dom.statusLeft.textContent = `${slides.length} شريحة`;
-
-      function draw(i) {
-        rail.querySelectorAll('.dv-slide-thumb').forEach((t, ti) => t.classList.toggle('active', ti === i));
-        const s = slides[i];
-        let html = '';
-        if (s.title) html += `<h3>${esc(s.title)}</h3>`;
-        if (s.bullets.length) html += `<ul>${s.bullets.map(b => `<li>${esc(b)}</li>`).join('')}</ul>`;
-        if (!s.title && !s.bullets.length && !s.images.length) html += `<div class="dv-slide-empty-text">لا يوجد نص قابل للاستخراج في هذه الشريحة</div>`;
-        s.images.forEach(src => html += `<img src="${src}">`);
-        stage.innerHTML = `<div class="dv-slide-canvas">${html}</div>`;
-        state.searchTarget = stage;
-      }
-      slides.forEach((s, i) => {
-        const t = document.createElement('div');
-        t.className = 'dv-slide-thumb';
-        t.innerHTML = `<span class="dv-slide-thumb-num">${i + 1}</span>${esc(s.title || '(بدون عنوان)')}`;
-        t.addEventListener('click', () => draw(i));
-        rail.appendChild(t);
-      });
-      draw(0);
-      addSearchToggle();
-    } catch (err) {
-      console.error(err);
-      showError('تعذّر عرض الشرائح داخل التطبيق', 'يمكن تحميل الملف وفتحه في برنامج العروض التقديمية.');
-    }
+  function renderPptx() {
+    return PptxViewer.render({ fetchBytes, showLoading, showError, setInfoExtra, addSearchToggle, esc, dom, state });
   }
 
   // ══════════════════════════════════════════════════════════

@@ -62,6 +62,7 @@ Module._load = function (request, parent, isMain) { if (request === 'electron') 
     ['/css/viewer.css', 'text/css'],
     ['/js/viewer.js', 'javascript'],
     ['/js/pdf-engine.js', 'javascript'],
+    ['/js/viewers/pptx-viewer.js', 'javascript'],
     ['/js/vendor/pdfjs/pdf.min.mjs', 'javascript'],
     ['/js/vendor/pdfjs/pdf.worker.min.mjs', 'javascript'],
     ['/js/vendor/mammoth/mammoth.browser.min.js', 'javascript'],
