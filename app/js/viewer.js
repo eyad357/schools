@@ -51,6 +51,12 @@ const Viewer = (function () {
   // ── module state ──
   let dom = null;
   let state = null;
+  // Generic extension points any specialized viewer engine can use via its
+  // ctx object — NOT pptx-specific. A render function may register at most
+  // one of each; the shell invokes/clears them itself so an engine never
+  // has to know about (or duplicate) cleanupPrevious()/onKeydown().
+  let extraKeyHandler = null; // (KeyboardEvent) => boolean — return true if handled (stops the shell's own key handling for that event)
+  let extraCleanup = null;    // () => void — called once by cleanupPrevious() before the next file opens or the viewer closes
 
   function freshState() {
     return {
@@ -151,6 +157,7 @@ const Viewer = (function () {
 
   function onKeydown(e) {
     if (!dom || !dom.overlay.classList.contains('open')) return;
+    if (extraKeyHandler && extraKeyHandler(e)) return;
     if (e.key === 'Escape') {
       if (state.searchOpen) closeSearch(); else close();
     } else if (e.key === 'f' || e.key === 'F') {
@@ -239,6 +246,8 @@ const Viewer = (function () {
 
   function cleanupPrevious() {
     if (!state) return;
+    if (extraCleanup) { try { extraCleanup(); } catch {} extraCleanup = null; }
+    extraKeyHandler = null;
     state.objectUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch {} });
     if (state.pdfDoc && typeof PDFEngine !== 'undefined') PDFEngine.destroyDocument(state.pdfDoc);
     else if (state.pdfDoc) { try { state.pdfDoc.destroy(); } catch {} }
@@ -1054,7 +1063,12 @@ const Viewer = (function () {
   // off to it.
   // ══════════════════════════════════════════════════════════
   function renderPptx() {
-    return PptxViewer.render({ fetchBytes, showLoading, showError, setInfoExtra, addSearchToggle, esc, dom, state });
+    return PptxViewer.render({
+      fetchBytes, showLoading, showError, setInfoExtra, addSearchToggle, esc, dom, state,
+      addToolBtn, addSep, addZoomControls, toggleFullscreen,
+      setKeyHandler: (fn) => { extraKeyHandler = fn; },
+      onCleanup: (fn) => { extraCleanup = fn; },
+    });
   }
 
   // ══════════════════════════════════════════════════════════

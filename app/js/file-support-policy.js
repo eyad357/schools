@@ -303,7 +303,7 @@
       contentExtraction: { supported: true }, thumbnail: { supported: false, engine: null },
       search: { supported: true }, ocr: { supported: false },
       displayNameAr: 'عرض PowerPoint', fallback: 'preview', signature: SIG.ZIP,
-      notes: 'Extracts slide titles/text/tables/images from the raw OOXML and approximates each shape\'s real on-slide position via its <a:xfrm> (percentage-based, so layout roughly matches the source). Does NOT reproduce real PowerPoint fonts, gradients/shadows/theme colors, animations, transitions, or embedded charts/SmartArt graphics — partial fidelity by design, not a bug.',
+      notes: 'Renders slides from the raw OOXML with theme/layout/master-inherited backgrounds and colors, real per-run font size/bold/italic/underline/color, shape position/rotation/fill/border, RTL, bullets, and tables. Does NOT reproduce actual PowerPoint fonts (browser substitutes), gradients/pictures beyond a flat-color approximation, shadows/3D effects, animations/transitions, or embedded charts/SmartArt graphics — partial fidelity by design, not a bug.',
     },
     ppsx: {
       // PowerPoint Show — the exact same OOXML/ZIP package format as
@@ -624,7 +624,7 @@
     'pdfjs': { zoom: true, fitWidth: true, fitPage: true, pageNavigation: true, thumbnails: true, rotate: true, search: true, print: true, fullscreen: true },
     'mammoth': { zoom: true, search: true, fullscreen: true },
     'sheetjs': { sheetNavigation: true, search: true, fullscreen: true },
-    'pptx-text-extract': { slideNavigation: true, search: true, fullscreen: true },
+    'pptx-text-extract': { slideNavigation: true, zoom: true, presentationMode: true, search: true, fullscreen: true },
     'native-image': { zoom: true, pan: true, rotate: true, gallery: true, fullscreen: true },
     'native-media-video': { playback: true, seek: true, volume: true, playbackSpeed: true, fullscreen: true },
     'native-media-audio': { playback: true, seek: true, volume: true, playbackSpeed: true },

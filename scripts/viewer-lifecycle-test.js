@@ -147,19 +147,21 @@ check('capabilities claimed for image match toolbar controls actually built in r
   if (caps.gallery) assert(/galleryFiles/.test(body), 'claims gallery capability but renderImage() has no gallery logic');
 });
 
-check('excel/pptx capability tables do NOT falsely claim zoom (neither render function wires it up today)', () => {
+check('excel capability table does NOT falsely claim zoom (renderExcel() does not wire it up today)', () => {
   const xlsxBody = extractFunctionBody(viewerSrc, /async function renderExcel\(\)\s*\{/);
-  // PPTX's real rendering logic was extracted to its own specialized
-  // engine file in Phase 7.5 (app/js/viewers/pptx-viewer.js) — viewer.js
-  // now only has a thin adapter that hands off to it, so the zoom-control
-  // check has to look at the engine file, not at viewer.js's adapter body.
-  const pptxEngineSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-viewer.js'), 'utf8');
   assert(!/addZoomControls/.test(xlsxBody), 'renderExcel() unexpectedly has zoom now — update VIEWER_CAPABILITIES_BY_ENGINE.sheetjs to add zoom:true');
-  assert(!/addZoomControls/.test(pptxEngineSrc), 'pptx-viewer.js unexpectedly has zoom now — update VIEWER_CAPABILITIES_BY_ENGINE[\'pptx-text-extract\'] to add zoom:true');
   const xlsxCaps = FileSupportPolicy.getViewerCapabilities('x.xlsx');
-  const pptxCaps = FileSupportPolicy.getViewerCapabilities('x.pptx');
   assert(!xlsxCaps.zoom, 'VIEWER_CAPABILITIES_BY_ENGINE.sheetjs falsely claims zoom:true');
-  assert(!pptxCaps.zoom, 'VIEWER_CAPABILITIES_BY_ENGINE[\'pptx-text-extract\'] falsely claims zoom:true');
+});
+
+check('pptx capability table\'s zoom:true claim is real (Phase 6A: pptx-viewer.js actually wires up addZoomControls)', () => {
+  // PPTX's real rendering logic lives in its own specialized engine file
+  // (app/js/viewers/pptx-viewer.js) — this checks THAT file, not viewer.js's
+  // thin adapter, since that's where the real implementation is.
+  const pptxEngineSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-viewer.js'), 'utf8');
+  assert(/addZoomControls/.test(pptxEngineSrc), 'pptx-viewer.js no longer wires up zoom — either restore it or set VIEWER_CAPABILITIES_BY_ENGINE[\'pptx-text-extract\'].zoom back to false/absent');
+  const pptxCaps = FileSupportPolicy.getViewerCapabilities('x.pptx');
+  assert(pptxCaps.zoom, 'VIEWER_CAPABILITIES_BY_ENGINE[\'pptx-text-extract\'] should claim zoom:true now that pptx-viewer.js actually implements it');
 });
 
 // ══════════════════════════════════════════════════════════════════

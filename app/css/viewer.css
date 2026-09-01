@@ -195,6 +195,14 @@ mark.dv-hit.dv-hit-current{ background:#ff6f00; color:#fff; }
 .dv-slide-table{ border-collapse:collapse; width:100%; height:100%; font-size:.72rem; }
 .dv-slide-table td{ border:1px solid #ccd3dc; padding:3px 6px; overflow:hidden; text-overflow:ellipsis; }
 .dv-slide-empty-text{ color:var(--muted); font-size:.8rem; font-style:italic; position:absolute; inset:0; display:flex; align-items:center; justify-content:center; }
+.dv-slide-counter{ color:rgba(255,255,255,.85); font-size:.75rem; font-weight:700; padding:0 8px; min-width:64px; text-align:center; user-select:none; }
+/* Presentation mode: hide the thumbnail rail and let the slide use the
+   full stage width — combined with the shell's own fullscreen (triggered
+   alongside this via ctx.toggleFullscreen()), this is what makes the
+   viewer feel like an actual presentation rather than a document preview. */
+.dv-slides-wrap.dv-presenting .dv-slides-rail{ display:none; }
+.dv-slides-wrap.dv-presenting .dv-slide-canvas{ max-width:100%; }
+.dv-btn-active{ background:var(--accent); color:#fff; }
 
 /* ── Media (video/audio) viewer ──────────────────────────── */
 .dv-media-wrap{ width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:18px; }
