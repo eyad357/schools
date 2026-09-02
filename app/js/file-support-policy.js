@@ -303,7 +303,7 @@
       contentExtraction: { supported: true }, thumbnail: { supported: false, engine: null },
       search: { supported: true }, ocr: { supported: false },
       displayNameAr: 'عرض PowerPoint', fallback: 'preview', signature: SIG.ZIP,
-      notes: 'Renders slides from the raw OOXML with theme/layout/master-inherited backgrounds and colors, real per-run font size/bold/italic/underline/color, shape position/rotation/fill/border, RTL, bullets, and tables. Does NOT reproduce actual PowerPoint fonts (browser substitutes), gradients/pictures beyond a flat-color approximation, shadows/3D effects, animations/transitions, or embedded charts/SmartArt graphics — partial fidelity by design, not a bug.',
+      notes: 'Renders slides from the raw OOXML with theme/layout/master-inherited backgrounds and colors (including real multi-stop gradients), real per-run font size/bold/italic/underline/color, shape position/rotation/fill/border, RTL, bullets, tables, and shrink-to-fit text (both PowerPoint\'s own stored autofit and a live fallback pass). Does NOT reproduce actual PowerPoint fonts (browser substitutes), radial/picture backgrounds beyond a linear-gradient approximation, shadows/3D effects, animations/transitions, or embedded charts/SmartArt graphics — partial fidelity by design, not a bug.',
     },
     ppsx: {
       // PowerPoint Show — the exact same OOXML/ZIP package format as

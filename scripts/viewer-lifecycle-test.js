@@ -271,6 +271,38 @@ check('pptx-viewer.js isolates a single bad slide or shape instead of letting it
   assert(/catch \(slideErr\)/.test(pptxEngineSrc), 'per-slide try/catch (catch (slideErr)) is missing — one malformed slide could crash the whole presentation again');
 });
 
+// ══════════════════════════════════════════════════════════════════
+// Two shell-level regressions found via manual testing of a real PPTX
+// (not PPTX-specific bugs, but the file info header/toolbar they show
+// up in are exercised by every viewer including PPTX's):
+//   1. "NaN KB" file size — evidenceService.listFiles() returns BOTH a
+//      pre-formatted `size` string ("12.4 KB") and a raw `bytes` number;
+//      viewer.js's `file.size ?? file.bytes` always picked the string
+//      (never null) and ran byte-math on it. Fixed by preferring
+//      `bytes` first and making fmtBytes() defensive either way.
+//   2. Slide counter showing "58 / 2" instead of "2 / 58" — plain text
+//      "2 / 58" inside an RTL-context element let the browser's bidi
+//      algorithm reorder the two numeral groups around the "/". Fixed
+//      with an explicit direction:ltr/unicode-bidi:isolate rule.
+// ══════════════════════════════════════════════════════════════════
+
+check('viewer.js prefers the raw `bytes` field over the pre-formatted `size` string when displaying file size (the "NaN KB" bug)', () => {
+  assert(/fmtBytes\(file\.bytes \?\? file\.size\)/.test(viewerSrc), 'the subtitle file-size display no longer prefers file.bytes over file.size — this is what produced "NaN KB", since evidenceService returns size as an already-formatted string like "12.4 KB"');
+  assert(/fmtBytes\(f\.bytes \?\? f\.size\)/.test(viewerSrc), 'the info-panel file-size display no longer prefers f.bytes over f.size');
+});
+
+check('fmtBytes() is defensive against being handed an already-formatted size string (defense in depth for the "NaN KB" bug)', () => {
+  const body = extractFunctionBody(viewerSrc, /function fmtBytes\(n\)\s*\{/);
+  assert(/typeof n === 'string'/.test(body), 'fmtBytes() no longer detects a pre-formatted string input — a future caller passing `file.size` directly (e.g. a new call site) would silently produce "NaN" again instead of degrading gracefully');
+});
+
+check('the slide counter forces LTR direction so RTL page context cannot reorder the "current / total" numerals ("58 / 2" bug)', () => {
+  const css = fs.readFileSync(path.join(__dirname, '..', 'app', 'css', 'viewer.css'), 'utf8');
+  const rule = css.match(/\.dv-slide-counter\s*\{[^}]*\}/);
+  assert(rule, '.dv-slide-counter rule is missing from viewer.css');
+  assert(/direction\s*:\s*ltr/.test(rule[0]), '.dv-slide-counter no longer forces direction:ltr — the "current / total" numerals can be visually reordered by the surrounding RTL context again');
+});
+
 console.log('\n=== VIEWER LIFECYCLE / CAPABILITY REGRESSION RESULTS ===');
 let pass = 0;
 for (const [name, status] of results) {

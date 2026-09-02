@@ -49,18 +49,31 @@
      - slide background, INCLUDING inheritance: slide -> slide layout ->
        slide master, with theme color-scheme (<a:clrScheme>) resolution
        for schemeClr/sysClr references, not just literal srgbClr
+     - multi-stop gradient fills (backgrounds AND shape fills), rendered
+       as a real CSS linear-gradient() with every stop's actual position
+       and color, not just an approximation of one stop
      - per-run text formatting: real font size (pt, converted to actual
        px from the rendered canvas width so it scales correctly), bold,
        italic, underline, text color (same theme-color resolution)
-     - shape fill color and border (solidFill/ln), also theme-resolved
+     - PowerPoint's own precomputed "shrink text to fit" factor
+       (<a:normAutofit fontScale/lnSpcReduction>) where the source file
+       stored one, PLUS a live shrink-to-fit pass (shrinkTextToFit) as a
+       safety net for shapes that don't — either because autofit was
+       never stored, or because the browser's substituted font renders
+       slightly wider/taller than PowerPoint's own
+     - shape fill color/gradient and border (solidFill/gradFill/ln), also
+       theme-resolved
      - paragraph alignment, RTL direction/detection, bullets
      - vertical text anchor (top/middle/bottom) within a shape
      - simple tables
    Deliberately NOT attempted (documented limitation, not a bug):
-     - real PowerPoint fonts (the browser substitutes its own)
-     - gradient/picture slide backgrounds beyond a flat color
-       approximation (a gradient's first stop; a picture background falls
-       back to no background rather than a wrong guess)
+     - real PowerPoint fonts (the browser substitutes its own — this is
+       also *why* the live shrink-to-fit pass above exists, not just
+       normAutofit)
+     - non-linear gradients (radial/path/circle — common for decorative
+       slide-master backgrounds) are approximated as a linear-gradient
+       through the same stops/colors/order rather than reproduced exactly
+     - picture slide backgrounds (no background rather than a wrong guess)
      - shadows, 3D effects, non-rectangular autoshape geometry
      - animations, transitions, embedded charts/SmartArt graphics (their
        text, where present in the XML, is still extracted)
@@ -200,8 +213,8 @@ const PptxViewer = (function () {
   }
 
   // Resolves ONE container's own background (a slide, its layout, or its
-  // master each have the same <p:cSld><p:bg> shape) — solid fill,
-  // gradient (approximated by its first stop's color), or a scheme-color
+  // master each have the same <p:cSld><p:bg> shape) — solid fill, a real
+  // multi-stop CSS gradient (see buildGradientCss), or a scheme-color
   // background reference. A picture/blip background is left unresolved
   // (see file header) rather than guessed.
   function resolveOwnBackground(xdoc, clrScheme) {
@@ -212,11 +225,7 @@ const PptxViewer = (function () {
       const solidFill = bgPr.getElementsByTagName('a:solidFill')[0];
       if (solidFill) { const c = resolveColor(solidFill, clrScheme); if (c) return c; }
       const gradFill = bgPr.getElementsByTagName('a:gradFill')[0];
-      if (gradFill) {
-        const firstStop = gradFill.getElementsByTagName('a:gs')[0];
-        const c = firstStop && resolveColor(firstStop, clrScheme);
-        if (c) return c;
-      }
+      if (gradFill) { const g = buildGradientCss(gradFill, clrScheme); if (g) return g; }
     }
     const bgRef = bg.getElementsByTagName('p:bgRef')[0];
     if (bgRef) { const c = resolveColor(bgRef, clrScheme); if (c) return c; }
@@ -261,9 +270,33 @@ const PptxViewer = (function () {
       rotDeg,
     };
   }
+  // Builds a real CSS linear-gradient() from OOXML's <a:gradFill> — all
+  // stops (not just the first, unlike the earlier flat-color
+  // approximation) with their actual positions/colors, and the actual
+  // angle. OOXML angles are measured clockwise from 3 o'clock (east);
+  // CSS linear-gradient() angles are measured clockwise from 12 o'clock
+  // (north) — hence the +90° conversion below.
+  function buildGradientCss(gradFillEl, clrScheme) {
+    const stops = Array.from(gradFillEl.getElementsByTagName('a:gs'));
+    if (!stops.length) return null;
+    const parsed = stops.map(gs => {
+      const posAttr = gs.getAttribute('pos'); // 0–100000 = 0–100%, in thousandths of a percent
+      const pos = posAttr ? parseInt(posAttr, 10) / 1000 : 0;
+      return { pos, color: resolveColor(gs, clrScheme) || '#000000' };
+    }).sort((a, b) => a.pos - b.pos);
+    const lin = gradFillEl.getElementsByTagName('a:lin')[0];
+    let angleDeg = 90; // no <a:lin> (e.g. a radial/path gradient) — approximate as left-to-right
+    const angAttr = lin && lin.getAttribute('ang');
+    if (angAttr) angleDeg = (parseInt(angAttr, 10) / 60000 + 90) % 360;
+    return `linear-gradient(${angleDeg}deg, ${parsed.map(s => `${s.color} ${s.pos}%`).join(', ')})`;
+  }
   function extractShapeFill(spPrEl, clrScheme) {
-    const solidFill = spPrEl && spPrEl.getElementsByTagName('a:solidFill')[0];
-    return solidFill ? resolveColor(solidFill, clrScheme) : null;
+    if (!spPrEl) return null;
+    const solidFill = spPrEl.getElementsByTagName('a:solidFill')[0];
+    if (solidFill) { const c = resolveColor(solidFill, clrScheme); if (c) return c; }
+    const gradFill = spPrEl.getElementsByTagName('a:gradFill')[0];
+    if (gradFill) { const g = buildGradientCss(gradFill, clrScheme); if (g) return g; }
+    return null;
   }
   function extractShapeBorder(spPrEl, clrScheme) {
     const ln = spPrEl && spPrEl.getElementsByTagName('a:ln')[0];
@@ -281,6 +314,32 @@ const PptxViewer = (function () {
     const bp = bodyPr && bodyPr.getElementsByTagName('a:bodyPr')[0];
     const anchor = bp && bp.getAttribute('anchor');
     return ANCHOR_TO_FLEX[anchor] || 'flex-start';
+  }
+  // PowerPoint's own "shrink text on overflow" autofit
+  // (<a:bodyPr><a:normAutofit fontScale="62500" lnSpcReduction="20000"/>) —
+  // when a user's text no longer fits its box, PowerPoint itself computes
+  // and stores exactly how much to shrink the font (fontScale) and tighten
+  // line spacing (lnSpcReduction), both in thousandths of a percent. This
+  // was previously never read, so shapes that relied on it rendered at
+  // full (too-large) size and got clipped by the shape's overflow:hidden —
+  // the actual cause of the cut-off card text seen in manual testing. Also
+  // paired with a live shrink-to-fit pass (see shrinkTextToFit in render())
+  // as a safety net for boxes where normAutofit is absent, stale, or
+  // insufficient because the browser's font metrics differ slightly from
+  // PowerPoint's.
+  function extractAutofit(spNode) {
+    const bodyPr = spNode.getElementsByTagName('p:txBody')[0];
+    const bp = bodyPr && bodyPr.getElementsByTagName('a:bodyPr')[0];
+    const normAutofit = bp && bp.getElementsByTagName('a:normAutofit')[0];
+    if (!normAutofit) return { fontScale: 1, lnSpcReduction: 0 };
+    const fs = normAutofit.getAttribute('fontScale');
+    const lr = normAutofit.getAttribute('lnSpcReduction');
+    const fontScale = fs ? parseInt(fs, 10) / 100000 : 1;
+    const lnSpcReduction = lr ? parseInt(lr, 10) / 100000 : 0;
+    return {
+      fontScale: Number.isFinite(fontScale) && fontScale > 0 ? fontScale : 1,
+      lnSpcReduction: Number.isFinite(lnSpcReduction) && lnSpcReduction >= 0 ? lnSpcReduction : 0,
+    };
   }
 
   // A paragraph is RTL if pPr explicitly says so, OR — since PowerPoint
@@ -440,15 +499,24 @@ const PptxViewer = (function () {
           // bare {} has no .props and reading .props.sizePt off it is
           // exactly what crashed before.
           const sizedSpan = spans.find(s => s.props.sizePt);
-          const sizePt = sizedSpan ? sizedSpan.props.sizePt : (isTitle ? defaultSizePt.title : defaultSizePt.body);
+          const rawSizePt = sizedSpan ? sizedSpan.props.sizePt : (isTitle ? defaultSizePt.title : defaultSizePt.body);
           lines.push({
-            spans, sizePt,
+            spans, sizePt: rawSizePt,
             rtl: paragraphIsRtl(p, lineText),
             align: paragraphAlign(p),
             bullet: paragraphBulletPrefix(p),
           });
         }
         if (!lines.length) return null;
+        // Apply PowerPoint's own precomputed shrink-to-fit factor (see
+        // extractAutofit) to every line's size and line-height together —
+        // this is what makes text that already fit in the real
+        // presentation fit here too, before the live shrinkTextToFit()
+        // safety net (in render(), for boxes without a stored autofit
+        // value) ever needs to do anything.
+        const autofit = extractAutofit(sp);
+        lines.forEach(l => { l.sizePt = l.sizePt * autofit.fontScale; });
+        const lineHeightEm = +(1.5 * (1 - autofit.lnSpcReduction)).toFixed(3);
         const pos = getXfrmPercent(sp.getElementsByTagName('p:spPr')[0], slideCx, slideCy);
         const fill = extractShapeFill(sp.getElementsByTagName('p:spPr')[0], clrScheme);
         const border = extractShapeBorder(sp.getElementsByTagName('p:spPr')[0], clrScheme);
@@ -462,7 +530,9 @@ const PptxViewer = (function () {
             if (s.props.color) style += `color:${s.props.color};`;
             return style ? `<span style="${style}">${esc(s.text)}</span>` : esc(s.text);
           }).join('');
-          return `<div class="dv-slide-line" data-pt="${l.sizePt}"${l.rtl ? ' dir="rtl"' : ''}${l.align ? ` style="text-align:${l.align}"` : ''}>${esc(l.bullet)}${spansHtml}</div>`;
+          let lineStyle = `line-height:${lineHeightEm};`;
+          if (l.align) lineStyle += `text-align:${l.align};`;
+          return `<div class="dv-slide-line" data-pt="${l.sizePt}"${l.rtl ? ' dir="rtl"' : ''} style="${lineStyle}">${esc(l.bullet)}${spansHtml}</div>`;
         }).join('');
         return { kind: isTitle ? 'title' : 'text', pos, html, isTitle, fill, border, anchor };
       }
@@ -561,6 +631,20 @@ const PptxViewer = (function () {
             }
           }
 
+          // Many real-world decks (like this one) are custom-designed
+          // without using an actual "title" placeholder on most slides —
+          // that's a legitimate authoring choice, not missing data, but
+          // it left the thumbnail rail showing "(بدون عنوان)" for nearly
+          // every slide even when the slide clearly has real content.
+          // Falls back to the first non-empty text shape's own first
+          // line, trimmed, so the rail is actually useful for navigation.
+          if (!title) {
+            const firstTextShape = shapes.find(sh => sh.kind === 'text' || sh.kind === 'title');
+            if (firstTextShape) {
+              const plain = firstTextShape.html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+              if (plain) title = plain.length > 60 ? plain.slice(0, 60) + '…' : plain;
+            }
+          }
           const bg = resolveSlideBackground(xdoc, layoutXdoc, masterXdoc, clrScheme);
           slides.push({ title, shapes, bg });
         } catch (slideErr) {
@@ -599,6 +683,41 @@ const PptxViewer = (function () {
           if (Number.isFinite(pt)) el.style.fontSize = (pt * pxPerPt) + 'px';
         });
       }
+      // Safety net for shapes whose text still overflows its box after
+      // applyFontScale() — either because the source file had no stored
+      // <a:normAutofit> value at all (extractAutofit() defaulted to no
+      // shrink), or because the browser's font metrics for the
+      // substituted font run slightly wider/taller than PowerPoint's own.
+      // Shrinks every sized line inside that ONE shape together (so
+      // relative sizes — e.g. a bigger heading vs. smaller body line —
+      // are preserved) in small steps until it fits or hits an 8px
+      // readability floor, at which point it stops and lets the shape's
+      // overflow:hidden clip as an honest last resort rather than
+      // continuing to shrink text into illegibility.
+      function shrinkTextToFit(canvasEl) {
+        canvasEl.querySelectorAll('.dv-slide-shape').forEach(shapeEl => {
+          const lines = shapeEl.querySelectorAll('[data-pt]');
+          if (!lines.length) return;
+          const maxH = shapeEl.clientHeight;
+          if (!maxH) return; // unconstrained (flow-fallback) shape — nothing to fit against
+          let guard = 0;
+          while (shapeEl.scrollHeight > maxH + 1 && guard < 8) {
+            let shrunkAny = false;
+            lines.forEach(el => {
+              const cur = parseFloat(el.style.fontSize) || 0;
+              if (cur <= 8) return;
+              el.style.fontSize = Math.max(8, cur * 0.94) + 'px';
+              shrunkAny = true;
+            });
+            if (!shrunkAny) break;
+            guard++;
+          }
+        });
+      }
+      function layoutText(canvasEl) {
+        applyFontScale(canvasEl);
+        shrinkTextToFit(canvasEl);
+      }
 
       function draw(i) {
         current = Math.max(0, Math.min(slides.length - 1, i));
@@ -628,7 +747,7 @@ const PptxViewer = (function () {
           shapeHtml || '<div class="dv-slide-empty-text">لا يوجد محتوى قابل للاستخراج في هذه الشريحة</div>'
         }</div>`;
         const canvasEl = stage.querySelector('.dv-slide-canvas');
-        applyFontScale(canvasEl);
+        layoutText(canvasEl);
         state.searchTarget = stage;
         updateNavUi();
       }
@@ -704,7 +823,7 @@ const PptxViewer = (function () {
       // would leak exactly like the pre-Phase-4 PDF observers did.
       const resizeObserver = new ResizeObserver(() => {
         const canvasEl = stage.querySelector('.dv-slide-canvas');
-        if (canvasEl) applyFontScale(canvasEl);
+        if (canvasEl) layoutText(canvasEl);
       });
       resizeObserver.observe(stage);
       onCleanup(() => resizeObserver.disconnect());

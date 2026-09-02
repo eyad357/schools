@@ -34,6 +34,16 @@ const Viewer = (function () {
 
   function fmtBytes(n) {
     if (n == null) return '—';
+    // The evidence-listing API (server/services/evidenceService.js
+    // listFiles()) returns BOTH a raw byte count (`bytes`) and an
+    // already human-formatted string (`size`, e.g. "12.4 KB") — callers
+    // are expected to prefer `bytes` and only pass `size` as a last
+    // resort. If a pre-formatted string still arrives here, use it
+    // as-is instead of running byte math on it (which produced the
+    // "NaN KB" display bug: `'12.4 KB' / 1024` is NaN).
+    if (typeof n === 'string' && !/^\d+$/.test(n.trim())) return n;
+    n = Number(n);
+    if (!Number.isFinite(n)) return '—';
     if (n < 1024) return n + ' B';
     const u = ['KB', 'MB', 'GB']; let i = -1;
     do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
@@ -196,7 +206,7 @@ const Viewer = (function () {
     }
 
     dom.filename.textContent = file.name;
-    dom.subtitle.textContent = `${FileSupportPolicy.labelFor(file.name)} · ${fmtBytes(file.size ?? file.bytes)}`;
+    dom.subtitle.textContent = `${FileSupportPolicy.labelFor(file.name)} · ${fmtBytes(file.bytes ?? file.size)}`;
     dom.icon.textContent = FileSupportPolicy.iconFor(file.name);
     dom.dlBtn.href = state.url;
     dom.dlBtn.download = file.name;
@@ -292,7 +302,7 @@ const Viewer = (function () {
       <h4>معلومات الملف</h4>
       <div class="dv-info-row"><span class="k">الاسم</span><span class="v">${esc(f.name)}</span></div>
       <div class="dv-info-row"><span class="k">النوع</span><span class="v">${esc(FileSupportPolicy.labelFor(f.name))}</span></div>
-      <div class="dv-info-row"><span class="k">الحجم</span><span class="v">${fmtBytes(f.size ?? f.bytes)}</span></div>
+      <div class="dv-info-row"><span class="k">الحجم</span><span class="v">${fmtBytes(f.bytes ?? f.size)}</span></div>
       <div class="dv-info-row"><span class="k">آخر تعديل</span><span class="v">${fmtDate(f.modified || f.mtime)}</span></div>
       <div class="dv-info-row"><span class="k">رمز المؤشر</span><span class="v">${esc(state.code)}</span></div>
       <div id="dv-info-extra"></div>
