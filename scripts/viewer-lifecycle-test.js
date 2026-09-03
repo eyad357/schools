@@ -250,25 +250,95 @@ check('index.html loads js/viewers/pptx-viewer.js before js/viewer.js', () => {
 // case, not a rare edge case.
 // ══════════════════════════════════════════════════════════════════
 
-check('pptx-viewer.js has no `.find(...) || {})` followed by a chained property read (the exact pattern that crashed as "Cannot read properties of undefined (reading \'sizePt\')")', () => {
-  const pptxEngineSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-viewer.js'), 'utf8');
+// ══════════════════════════════════════════════════════════════════
+// Regression guards for the "Cannot read properties of undefined
+// (reading 'sizePt')" crash found in real-world manual testing (a real
+// PPTX where no run/paragraph anywhere specified an explicit font size —
+// extremely common, since PowerPoint usually resolves size from the
+// slide master's <p:txStyles> instead). Root cause was TWO things: (1)
+// `array.find(...) || {}` followed immediately by a second `.prop` read
+// — a bare `{}` fallback has no such property, so that pattern throws
+// instead of falling through; (2) the renderer never consulted
+// txStyles at all, so "no explicit size anywhere" was a common real
+// case, not a rare edge case.
+//
+// The Phase 6A-F module split (pptx-viewer.js -> +pptx-common.js
+// +pptx-shapes.js +pptx-charts.js +pptx-smartart.js) moved this logic
+// out of pptx-viewer.js: txStyles parsing now lives in pptx-common.js
+// (shared by every engine), and per-run text extraction/composition now
+// lives in pptx-shapes.js. These checks were updated to look at the
+// files the logic actually lives in now — NOT relaxed or removed.
+// ══════════════════════════════════════════════════════════════════
+
+check('pptx-shapes.js has no `.find(...) || {})` followed by a chained property read (the exact pattern that crashed as "Cannot read properties of undefined (reading \'sizePt\')")', () => {
+  const shapesSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-shapes.js'), 'utf8');
   assert(
-    !/\.find\([^)]*\)\s*\|\|\s*\{\}\)\s*\.[A-Za-z_$][\w$]*\s*\.[A-Za-z_$]/.test(pptxEngineSrc),
+    !/\.find\([^)]*\)\s*\|\|\s*\{\}\)\s*\.[A-Za-z_$][\w$]*\s*\.[A-Za-z_$]/.test(shapesSrc),
     'found `.find(...) || {})` followed by a two-level property access — a bare {} fallback has no nested property; use an explicit ternary or optional chaining that handles the no-match case instead'
   );
 });
 
-check('pptx-viewer.js resolves font size through real master <p:txStyles> inheritance, not just a flat guess (root-cause fix, not a defensive patch)', () => {
-  const pptxEngineSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-viewer.js'), 'utf8');
-  assert(/function parseTxStyles/.test(pptxEngineSrc), 'parseTxStyles() is missing — master-level <p:txStyles> font-size inheritance was removed');
-  assert(/function txStyleDefaultsFor/.test(pptxEngineSrc), 'txStyleDefaultsFor() is missing');
-  assert(/extractTextShape\(node, clrScheme, txStyles\)/.test(pptxEngineSrc), 'extractTextShape() is no longer called with txStyles — master-level font-size inheritance is disconnected from the render path');
+check('the pptx engine resolves font size through real master <p:txStyles> inheritance, not just a flat guess (root-cause fix, not a defensive patch)', () => {
+  const commonSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-common.js'), 'utf8');
+  const shapesSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-shapes.js'), 'utf8');
+  assert(/function parseTxStyles/.test(commonSrc), 'parseTxStyles() is missing from pptx-common.js — master-level <p:txStyles> font-size inheritance was removed');
+  assert(/function txStyleDefaultsFor/.test(commonSrc), 'txStyleDefaultsFor() is missing from pptx-common.js');
+  assert(/C\.txStyleDefaultsFor\(/.test(shapesSrc), 'pptx-shapes.js no longer calls txStyleDefaultsFor() — master-level font-size inheritance is disconnected from the render path');
 });
 
-check('pptx-viewer.js isolates a single bad slide or shape instead of letting it crash the whole presentation', () => {
-  const pptxEngineSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-viewer.js'), 'utf8');
-  assert(/catch \(shapeErr\)/.test(pptxEngineSrc), 'per-shape try/catch (catch (shapeErr)) is missing — one malformed shape could crash the whole slide again');
-  assert(/catch \(slideErr\)/.test(pptxEngineSrc), 'per-slide try/catch (catch (slideErr)) is missing — one malformed slide could crash the whole presentation again');
+check('the pptx engine isolates a single bad slide or shape instead of letting it crash the whole presentation', () => {
+  const viewerSrcCurrent = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-viewer.js'), 'utf8');
+  const shapesSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-shapes.js'), 'utf8');
+  assert(/catch \(shapeErr\)/.test(shapesSrc), 'per-shape try/catch (catch (shapeErr)) is missing from pptx-shapes.js — one malformed shape (including inside a group) could crash the whole slide again');
+  assert(/catch \(slideErr\)/.test(viewerSrcCurrent), 'per-slide try/catch (catch (slideErr)) is missing from pptx-viewer.js — one malformed slide could crash the whole presentation again');
+});
+
+// ══════════════════════════════════════════════════════════════════
+// Phase 6A-F — high-fidelity rendering (charts/SmartArt/groups/
+// connectors/text-less autoshapes). Guards against the module split
+// silently dropping a capability, and against the real, previously-
+// undiscovered <p:xfrm>-vs-<a:xfrm> graphicFrame positioning bug
+// (found while building the charts/SmartArt renderers — tables were
+// silently falling back to flow-layout instead of their real position)
+// regressing.
+// ══════════════════════════════════════════════════════════════════
+
+check('PptxCommon.getXfrm() checks BOTH a:xfrm and p:xfrm (graphicFrame — tables/charts/SmartArt — uses p:xfrm, not a:xfrm; checking only one silently drops every graphicFrame\'s real position)', () => {
+  const commonSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-common.js'), 'utf8');
+  const body = extractFunctionBody(commonSrc, /function getXfrm\(shapeOrFrameNode\)\s*\{/);
+  assert(/'a:xfrm'/.test(body) && /'p:xfrm'/.test(body), 'getXfrm() no longer checks both a:xfrm and p:xfrm — graphicFrame (table/chart/SmartArt) positioning will silently break again');
+});
+
+check('groups are resolved with real nested-transform composition (chOff/chExt), not flattened to a text-only approximation', () => {
+  const shapesSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-shapes.js'), 'utf8');
+  assert(/function composeGroupTransform/.test(shapesSrc), 'composeGroupTransform() is missing — group children would fall back to the old flatten-to-bounding-box-text-only approximation');
+  assert(/chOffX|chExtCx/.test(shapesSrc), 'group child-coordinate-space (chOff/chExt) mapping appears to have been removed');
+});
+
+check('text-less autoshapes (fill/border but no text) are rendered, not silently dropped (the 130-shape gap found on the real reference file)', () => {
+  const shapesSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-shapes.js'), 'utf8');
+  const body = extractFunctionBody(shapesSrc, /function extractTextShape\(sp, clrScheme, txStyles, pos, esc, defaultSizePt\)\s*\{/);
+  assert(/kind: 'autoshape'/.test(body), 'extractTextShape() no longer returns an autoshape entry for text-less shapes with a fill/border — they will silently disappear again');
+});
+
+check('connectors (<p:cxnSp>) and charts/SmartArt (<p:graphicFrame> uri-based dispatch) are wired into shape extraction', () => {
+  const shapesSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-shapes.js'), 'utf8');
+  assert(/'p:cxnSp'/.test(shapesSrc), 'p:cxnSp (connectors) is no longer handled in extractShapes()');
+  assert(/endsWith\('\/chart'\)/.test(shapesSrc) && /PptxCharts/.test(shapesSrc), 'chart graphicFrame dispatch to PptxCharts is missing');
+  assert(/endsWith\('\/diagram'\)/.test(shapesSrc) && /PptxSmartArt/.test(shapesSrc), 'diagram (SmartArt) graphicFrame dispatch to PptxSmartArt is missing');
+});
+
+check('index.html loads pptx-common.js before pptx-shapes.js/pptx-charts.js/pptx-smartart.js, and all of them before pptx-viewer.js', () => {
+  const indexHtml = fs.readFileSync(path.join(__dirname, '..', 'app', 'index.html'), 'utf8');
+  const idx = (needle) => indexHtml.indexOf(needle);
+  const common = idx('js/viewers/pptx-common.js');
+  const shapes = idx('js/viewers/pptx-shapes.js');
+  const charts = idx('js/viewers/pptx-charts.js');
+  const smartart = idx('js/viewers/pptx-smartart.js');
+  const shell = idx('js/viewer.js');
+  assert(common !== -1 && shapes !== -1 && charts !== -1 && smartart !== -1, 'app/index.html is missing one of the pptx-common/shapes/charts/smartart script tags');
+  assert(common < shapes && common < charts && common < smartart, 'pptx-common.js must load before pptx-shapes.js/pptx-charts.js/pptx-smartart.js (they depend on it)');
+  assert(Math.max(common, shapes, charts, smartart) < shell, 'all pptx engine modules must load before js/viewer.js');
 });
 
 // ══════════════════════════════════════════════════════════════════
