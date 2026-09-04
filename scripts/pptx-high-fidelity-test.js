@@ -272,7 +272,156 @@ const hasFixture = fs.existsSync(SAMPLE_PPTX);
     assert(/isActive:\s*\(\)\s*=>\s*state === myState/.test(viewerSrc), 'renderPptx() no longer builds a fresh isActive() closure around the render-time state reference — stale conversion responses could corrupt whatever file is now actually open');
   });
 
-  console.log('\n=== PPTX HIGH-FIDELITY FALLBACK — REGRESSION RESULTS ===');
+  // ══════════════════════════════════════════════════════════════════
+  // Phase 6C-F — genuine functional proof (not just structural) that:
+  //   1. Opening a PPTX/PPSX automatically selects the high-fidelity
+  //      path with NO click, when LibreOffice is available.
+  //   2. LibreOffice being unavailable, or the conversion failing,
+  //      correctly signals the caller to fall back to native.
+  // Runs PptxHighFidelity.renderAutomatic() for real (via Node's native
+  // fetch/URL/Blob — no new dependency needed) against a real server for
+  // case 1, and tiny stand-in HTTP servers for cases 2/3 that only need
+  // to answer the two specific endpoints being tested. Deliberately does
+  // NOT also spin up a full DOM to exercise PptxViewer.render()'s own
+  // two-line "if (handled) return; return renderNative(ctx);" glue —
+  // that glue has no meaningful logic of its own to get wrong (verified
+  // structurally below), and renderNative() itself (the full native
+  // engine) already has extensive dedicated coverage elsewhere in this
+  // suite and in viewer-lifecycle-test.js.
+  // ══════════════════════════════════════════════════════════════════
+
+  function loadPptxHighFidelity(apiBase) {
+    const vm = require('vm');
+    const src = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-high-fidelity.js'), 'utf8');
+    const sandbox = { window: { API: apiBase }, fetch, URL, Blob, console, setTimeout, clearTimeout };
+    vm.createContext(sandbox);
+    vm.runInContext(src + '\nglobalThis.PptxHighFidelity = PptxHighFidelity;', sandbox, { filename: 'pptx-high-fidelity.js' });
+    return sandbox.PptxHighFidelity;
+  }
+  function makeFakeCtx() {
+    const switchCalls = [];
+    const buttons = [];
+    return {
+      switchCalls, buttons,
+      showLoading: () => {},
+      isActive: () => true,
+      switchToPdfView: async (url) => { switchCalls.push(url); },
+      addToolBtn: (label) => { buttons.push(label); return {}; },
+      state: { objectUrls: [] },
+      reopenNative: () => {},
+    };
+  }
+
+  await check('PptxHighFidelity.renderAutomatic() automatically converts and switches to the PDF view — no click, real LibreOffice, real server', async () => {
+    if (!sofficeAvailable) throw new Error('LibreOffice not available in this environment');
+    if (!hasFixture) throw new Error('sample.pptx fixture not present');
+
+    const os2 = require('os');
+    const Module2 = require('module');
+    const fakeUserData = path.join(os2.tmpdir(), 'pptx-auto-test-userdata-' + Date.now());
+    const fakeDocs = path.join(os2.tmpdir(), 'pptx-auto-test-docs-' + Date.now());
+    fs.mkdirSync(fakeUserData, { recursive: true });
+    fs.mkdirSync(fakeDocs, { recursive: true });
+    process.env.SCHOOL_APP_TEST_INSTALL_DIR = fakeDocs;
+    const fakeElectron = { app: { isPackaged: false, getPath: (n) => (n === 'userData' ? fakeUserData : n === 'documents' ? fakeDocs : os2.tmpdir()), getVersion: () => '1.0.0-test' }, shell: { openPath: async () => {} } };
+    const origLoad2 = Module2._load;
+    Module2._load = function (request, parent, isMain) { if (request === 'electron') return fakeElectron; return origLoad2.call(this, request, parent, isMain); };
+
+    delete require.cache[require.resolve('../server/app')];
+    const { createApp } = require('../server/app');
+    const expressApp = await createApp();
+    const http = require('http');
+    const server = http.createServer(expressApp);
+    await new Promise((resolve) => server.listen(0, resolve));
+    const port = server.address().port;
+    const apiBase = `http://127.0.0.1:${port}`;
+
+    try {
+      await fetch(`${apiBase}/api/school`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Test School' }) });
+      const code = '1-1-1-1';
+      const pptxBuf = fs.readFileSync(SAMPLE_PPTX);
+      await fetch(`${apiBase}/api/upload/${code}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent('auto-test.pptx') }, body: pptxBuf });
+
+      const PptxHF = loadPptxHighFidelity(apiBase);
+      const ctx = makeFakeCtx();
+      const handled = await PptxHF.renderAutomatic(ctx, { code, filename: 'auto-test.pptx' });
+
+      assert(handled === true, 'renderAutomatic() should return true when LibreOffice successfully converts the file');
+      assert(ctx.switchCalls.length === 1, `expected switchToPdfView() to be called exactly once with no click, got ${ctx.switchCalls.length} calls`);
+      assert(/^blob:/.test(ctx.switchCalls[0]), `expected a blob: URL to be handed to switchToPdfView(), got ${ctx.switchCalls[0]}`);
+      assert(ctx.buttons.some(b => b.includes('العرض المحلي')), 'expected a "back to native" button to be added after switching to the automatic high-fidelity view');
+    } finally {
+      server.close();
+      Module2._load = origLoad2;
+      fs.rmSync(fakeUserData, { recursive: true, force: true });
+      fs.rmSync(fakeDocs, { recursive: true, force: true });
+    }
+  }, { envDependent: true });
+
+  await check('PptxHighFidelity.renderAutomatic() returns false (signals fallback to native) when LibreOffice is unavailable', async () => {
+    const http = require('http');
+    // A minimal stand-in server that only answers the availability
+    // check — deliberately NOT the real app, so this test is independent
+    // of whether LibreOffice actually happens to be installed on the
+    // machine running the suite.
+    const fakeServer = http.createServer((req, res) => {
+      if (req.url === '/api/pptx-high-fidelity/available') { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ available: false })); return; }
+      res.statusCode = 404; res.end();
+    });
+    await new Promise((resolve) => fakeServer.listen(0, resolve));
+    const apiBase = `http://127.0.0.1:${fakeServer.address().port}`;
+    try {
+      const PptxHF = loadPptxHighFidelity(apiBase);
+      const ctx = makeFakeCtx();
+      const handled = await PptxHF.renderAutomatic(ctx, { code: 'x', filename: 'whatever.pptx' });
+      assert(handled === false, 'renderAutomatic() should return false when LibreOffice is reported unavailable');
+      assert(ctx.switchCalls.length === 0, 'switchToPdfView() must not be called when LibreOffice is unavailable');
+    } finally {
+      fakeServer.close();
+    }
+  });
+
+  await check('PptxHighFidelity.renderAutomatic() returns false (signals fallback to native) when the conversion itself fails', async () => {
+    const http = require('http');
+    // Available, but every conversion attempt fails — proves the
+    // fallback signal also fires on a genuine mid-conversion failure,
+    // not only on "LibreOffice isn't installed".
+    const fakeServer = http.createServer((req, res) => {
+      if (req.url === '/api/pptx-high-fidelity/available') { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ available: true })); return; }
+      if (req.method === 'POST') { res.statusCode = 500; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ error: 'CONVERSION_FAILED', message: 'فشل التحويل.' })); return; }
+      res.statusCode = 404; res.end();
+    });
+    await new Promise((resolve) => fakeServer.listen(0, resolve));
+    const apiBase = `http://127.0.0.1:${fakeServer.address().port}`;
+    try {
+      const PptxHF = loadPptxHighFidelity(apiBase);
+      const ctx = makeFakeCtx();
+      const handled = await PptxHF.renderAutomatic(ctx, { code: 'x', filename: 'whatever.pptx' });
+      assert(handled === false, 'renderAutomatic() should return false when the conversion request fails');
+      assert(ctx.switchCalls.length === 0, 'switchToPdfView() must not be called when the conversion failed');
+    } finally {
+      fakeServer.close();
+    }
+  });
+
+  await check('PptxViewer.render() (the dispatch entry point) tries the high-fidelity path first and only falls back to renderNative() when it reports it could not handle the file', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewers', 'pptx-viewer.js'), 'utf8');
+    const body = (() => {
+      const start = src.indexOf('async function render(ctx) {');
+      const end = src.indexOf('\n  return { render, renderNative }', start);
+      return src.slice(start, end);
+    })();
+    assert(/PptxHighFidelity\.renderAutomatic\(/.test(body), 'render() no longer tries PptxHighFidelity.renderAutomatic() first — the default-to-high-fidelity behavior may have been removed');
+    assert(/if \(handled\) return;/.test(body), 'render() no longer short-circuits on a successful automatic high-fidelity render');
+    assert(/return renderNative\(ctx\);/.test(body), 'render() no longer falls back to renderNative() — native rendering may no longer be reachable at all');
+  });
+
+  await check('the "back to native" escape hatch calls renderNative() directly, not render() (which would just auto-convert again)', () => {
+    const viewerSrc = fs.readFileSync(path.join(__dirname, '..', 'app', 'js', 'viewer.js'), 'utf8');
+    assert(/ctx\.reopenNative = \(\) => PptxViewer\.renderNative\(ctx\);/.test(viewerSrc), 'renderPptx()\'s reopenNative no longer calls PptxViewer.renderNative(ctx) directly — clicking "back to native" would re-trigger automatic high-fidelity conversion instead of actually showing the native view');
+  });
+
+
   results.forEach((r) => console.log(r));
   console.log(`\n${passed}/${passed + failed} passed` + (results.some(r => r.startsWith('⏭️')) ? ' (some environment-dependent checks skipped — see ⏭️ above)' : ''));
   if (failed > 0) process.exit(1);

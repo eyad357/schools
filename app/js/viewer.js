@@ -1096,7 +1096,7 @@ const Viewer = (function () {
   // ══════════════════════════════════════════════════════════
   function renderPptx() {
     const myState = state; // identity-captured at render time; see ctx.isActive below
-    return PptxViewer.render({
+    const ctx = {
       fetchBytes, showLoading, showError, setInfoExtra, addSearchToggle, esc, dom, state,
       addToolBtn, addSep, addZoomControls, toggleFullscreen,
       setKeyHandler: (fn) => { extraKeyHandler = fn; },
@@ -1111,10 +1111,17 @@ const Viewer = (function () {
       isActive: () => state === myState,
       // Lets a specialized engine (currently only the PPTX high-fidelity
       // fallback) hand off to the existing PDF viewer instead of building
-      // its own, and lets it hand back to this same native render.
+      // its own.
       switchToPdfView,
-      reopenNative: renderPptx,
-    });
+    };
+    // Deliberately calls PptxViewer.renderNative(ctx) directly, NOT
+    // PptxViewer.render(ctx) (which would re-run the high-fidelity-first
+    // flow and just convert again) — this is specifically the "go back
+    // to the native render" escape hatch, reusing the exact same ctx
+    // (same isActive/switchToPdfView/state) so it composes correctly
+    // however the user got here.
+    ctx.reopenNative = () => PptxViewer.renderNative(ctx);
+    return PptxViewer.render(ctx);
   }
 
   // ══════════════════════════════════════════════════════════

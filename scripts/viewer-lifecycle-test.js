@@ -226,7 +226,7 @@ check('app/js/viewers/pptx-viewer.js exists and exposes the PptxViewer.render(ct
   assert(fs.existsSync(enginePath), 'app/js/viewers/pptx-viewer.js is missing');
   const src = fs.readFileSync(enginePath, 'utf8');
   assert(/const PptxViewer = \(function/.test(src), 'pptx-viewer.js should expose a PptxViewer module, matching the pattern used by pdf-engine.js/file-support-policy.js');
-  assert(/return \{ render \}/.test(src), 'pptx-viewer.js should expose a render(ctx) function');
+  assert(/return \{ render, renderNative \}/.test(src), 'pptx-viewer.js should expose both render(ctx) (the high-fidelity-first entry point, Phase 6C-F) and renderNative(ctx) (the underlying native engine, used both as its fallback and by the "back to native" button)');
 });
 
 check('index.html loads js/viewers/pptx-viewer.js before js/viewer.js', () => {

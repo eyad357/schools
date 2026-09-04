@@ -44,12 +44,22 @@ router.post('/pptx-high-fidelity/:code/:name', async (req, res) => {
     return res.status(404).json({ error: 'NOT_FOUND', message: 'تعذّر العثور على الملف.' });
   }
 
+  // Phase 6C-F: the automatic default-on-open flow (see
+  // app/js/viewers/pptx-high-fidelity.js's renderAutomatic) wants a much
+  // shorter deadline than an explicit user-initiated retry — nobody
+  // should wait 2 minutes on file OPEN just to find out it's falling
+  // back to native anyway. Callers may pass ?timeoutMs=N; clamped to a
+  // sane range so a caller can't request an effectively-infinite wait
+  // (0 would disable execFile's own timeout) or an unreasonably long one.
+  const requestedTimeout = parseInt(req.query.timeoutMs, 10);
+  const timeoutMs = Number.isFinite(requestedTimeout) ? Math.min(180000, Math.max(3000, requestedTimeout)) : 120000;
+
   let conversion;
   try {
     // No file-size limit here by design (see PHASE_6C brief) — a large
     // deck simply takes longer, bounded only by the timeout below, which
     // is generous specifically so large real-world decks aren't cut off.
-    conversion = await libreOfficeService.convertToPdf(filePath, { timeoutMs: 120000 });
+    conversion = await libreOfficeService.convertToPdf(filePath, { timeoutMs });
   } catch (err) {
     const status = ERROR_STATUS[err.code] || 500;
     log.warn(`[pptx-high-fidelity] conversion failed for ${code}/${name}: ${err.code || err.message}`);

@@ -117,7 +117,7 @@ const PptxViewer = (function () {
   // here so the rest of this file reads the same as before.
   const C = PptxCommon;
 
-  async function render(ctx) {
+  async function renderNative(ctx) {
     const {
       fetchBytes, showLoading, showError, setInfoExtra, addSearchToggle, esc, dom, state,
       addToolBtn, addSep, addZoomControls, toggleFullscreen, setKeyHandler, onCleanup,
@@ -430,5 +430,31 @@ const PptxViewer = (function () {
     }
   }
 
-  return { render };
+  // ── Phase 6C-F: high-fidelity-by-default entry point ────────────────
+  // This is now what renderersByEngine['pptx-text-extract'] actually
+  // calls (via viewer.js's renderPptx() adapter, unchanged). Every
+  // .pptx/.ppsx now tries the LibreOffice conversion FIRST, with no
+  // click required; renderNative() above (the entire previous Phase
+  // 6A-F engine, untouched) only runs when PptxHighFidelity.
+  // renderAutomatic() reports it could not — LibreOffice unavailable,
+  // conversion failed, or it timed out. See pptx-high-fidelity.js's own
+  // header comment for the full contract.
+  async function render(ctx) {
+    if (typeof PptxHighFidelity !== 'undefined' && ctx.state && ctx.state.file) {
+      try {
+        const handled = await PptxHighFidelity.renderAutomatic(ctx, { code: ctx.state.code, filename: ctx.state.file.name });
+        if (handled) return;
+      } catch (err) {
+        // renderAutomatic() is written to resolve false rather than
+        // throw for ordinary failure modes (unavailable/failed/timeout)
+        // — a throw here means something unexpected broke in the
+        // high-fidelity path itself. Fail safe: still fall through to
+        // the native renderer rather than leaving the viewer blank.
+        console.warn('[pptx-viewer] high-fidelity auto-render threw unexpectedly, falling back to native', err);
+      }
+    }
+    return renderNative(ctx);
+  }
+
+  return { render, renderNative };
 })();
