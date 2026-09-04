@@ -252,7 +252,7 @@ const PptxCharts = (function () {
         case 'doughnut': html = renderPieOrDoughnut(series, esc, title, true); break;
         default: html = renderDataTable(series, esc, title, CHART_TYPE_LABEL[chartKind] || 'رسم بياني');
       }
-      return { kind: 'chart', pos, html };
+      return { kind: 'chart', pos, html, degraded: chartKind === 'other' };
     } catch (err) {
       console.warn('[pptx-charts] failed to render a chart, skipping it', err);
       return null;

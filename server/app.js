@@ -120,6 +120,7 @@ async function createApp() {
   app.use('/api/integrity', require('./routes/integrity'));
   app.use('/api/events', require('./routes/events'));
   app.use('/api', require('./routes/files')); // /api/files/:code, /api/file/:code/:name, /api/upload(-raw)/:code, /api/open-folder/:code
+  app.use('/api', require('./routes/pptxHighFidelity')); // GET /api/pptx-high-fidelity/available, POST /api/pptx-high-fidelity/:code/:name
   app.use('/api/settings', require('./routes/settings'));
   app.use('/api/license', require('./routes/license'));
   app.use('/api/audit', require('./routes/audit'));

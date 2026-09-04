@@ -600,6 +600,28 @@ const Viewer = (function () {
     }, 500);
   }
 
+  // Switches the CURRENTLY OPEN file's content area over to the existing
+  // PDF viewer, pointed at a different URL than the file's own
+  // `/api/file/:code/:name` (e.g. a server-generated high-fidelity
+  // conversion of a PPTX) — this is how a specialized engine (currently
+  // only PPTX's high-fidelity fallback, via ctx.switchToPdfView) reuses
+  // renderPdf() instead of a second PDF renderer being built. This is
+  // NOT "open a different file": state.code/state.file keep identifying
+  // the original evidence file; only what's rendered changes. Callers
+  // are responsible for their own staleness check (e.g. ctx.isActive())
+  // before calling this — it unconditionally mutates the live state/DOM.
+  function switchToPdfView(pdfUrl) {
+    cleanupPrevious();
+    state.url = pdfUrl;
+    state.category = 'pdf';
+    dom.toolbar.innerHTML = '';
+    dom.sidebar.hidden = true;
+    dom.sidebar.innerHTML = '';
+    dom.content.className = 'dv-content';
+    dom.content.innerHTML = '';
+    return renderPdf();
+  }
+
   async function renderPdf() {
     showLoading('جارٍ تحميل ملف PDF…');
     addZoomControls(zoomPdf, 1);
@@ -1073,11 +1095,25 @@ const Viewer = (function () {
   // off to it.
   // ══════════════════════════════════════════════════════════
   function renderPptx() {
+    const myState = state; // identity-captured at render time; see ctx.isActive below
     return PptxViewer.render({
       fetchBytes, showLoading, showError, setInfoExtra, addSearchToggle, esc, dom, state,
       addToolBtn, addSep, addZoomControls, toggleFullscreen,
       setKeyHandler: (fn) => { extraKeyHandler = fn; },
       onCleanup: (fn) => { extraCleanup = fn; },
+      // True only while THIS render is still the one the user has open —
+      // `state` here is the shell's live module-level binding, re-read
+      // fresh on every call, so it stops matching `myState` the instant
+      // open()/close() replaces it with freshState(). Needed because the
+      // high-fidelity fallback's server round-trip can easily outlive the
+      // user switching to a different evidence file mid-conversion; a
+      // stale response must never mutate whatever is now on screen.
+      isActive: () => state === myState,
+      // Lets a specialized engine (currently only the PPTX high-fidelity
+      // fallback) hand off to the existing PDF viewer instead of building
+      // its own, and lets it hand back to this same native render.
+      switchToPdfView,
+      reopenNative: renderPptx,
     });
   }
 

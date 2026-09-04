@@ -66,6 +66,7 @@ Module._load = function (request, parent, isMain) { if (request === 'electron') 
     ['/js/viewers/pptx-shapes.js', 'javascript'],
     ['/js/viewers/pptx-charts.js', 'javascript'],
     ['/js/viewers/pptx-smartart.js', 'javascript'],
+    ['/js/viewers/pptx-high-fidelity.js', 'javascript'],
     ['/js/viewers/pptx-viewer.js', 'javascript'],
     ['/js/vendor/pdfjs/pdf.min.mjs', 'javascript'],
     ['/js/vendor/pdfjs/pdf.worker.min.mjs', 'javascript'],

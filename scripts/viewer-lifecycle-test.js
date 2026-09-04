@@ -328,17 +328,18 @@ check('connectors (<p:cxnSp>) and charts/SmartArt (<p:graphicFrame> uri-based di
   assert(/endsWith\('\/diagram'\)/.test(shapesSrc) && /PptxSmartArt/.test(shapesSrc), 'diagram (SmartArt) graphicFrame dispatch to PptxSmartArt is missing');
 });
 
-check('index.html loads pptx-common.js before pptx-shapes.js/pptx-charts.js/pptx-smartart.js, and all of them before pptx-viewer.js', () => {
+check('index.html loads pptx-common.js before pptx-shapes.js/pptx-charts.js/pptx-smartart.js/pptx-high-fidelity.js, and all of them before pptx-viewer.js', () => {
   const indexHtml = fs.readFileSync(path.join(__dirname, '..', 'app', 'index.html'), 'utf8');
   const idx = (needle) => indexHtml.indexOf(needle);
   const common = idx('js/viewers/pptx-common.js');
   const shapes = idx('js/viewers/pptx-shapes.js');
   const charts = idx('js/viewers/pptx-charts.js');
   const smartart = idx('js/viewers/pptx-smartart.js');
+  const hifi = idx('js/viewers/pptx-high-fidelity.js');
   const shell = idx('js/viewer.js');
-  assert(common !== -1 && shapes !== -1 && charts !== -1 && smartart !== -1, 'app/index.html is missing one of the pptx-common/shapes/charts/smartart script tags');
+  assert(common !== -1 && shapes !== -1 && charts !== -1 && smartart !== -1 && hifi !== -1, 'app/index.html is missing one of the pptx-common/shapes/charts/smartart/high-fidelity script tags');
   assert(common < shapes && common < charts && common < smartart, 'pptx-common.js must load before pptx-shapes.js/pptx-charts.js/pptx-smartart.js (they depend on it)');
-  assert(Math.max(common, shapes, charts, smartart) < shell, 'all pptx engine modules must load before js/viewer.js');
+  assert(Math.max(common, shapes, charts, smartart, hifi) < shell, 'all pptx engine modules must load before js/viewer.js');
 });
 
 // ══════════════════════════════════════════════════════════════════

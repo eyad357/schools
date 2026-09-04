@@ -147,6 +147,15 @@ const PptxViewer = (function () {
       const inheritanceCache = { byLayout: {}, byTheme: {} };
 
       const slides = [];
+      // Cheap signal for the high-fidelity fallback decision (see
+      // app/js/viewers/pptx-high-fidelity.js) — NOT used for rendering
+      // itself, so a lightweight raw-text scan alongside the real parse
+      // is fine (no extra DOM parsing needed for the two things not
+      // already tracked as shape kinds: visual effects and animations).
+      const nativeCapabilities = {
+        hasCharts: false, degradedChartCount: 0, hasSmartArt: false,
+        hasUnsupportedObjects: false, hasEffects: false, hasAnimations: false,
+      };
       for (const slidePath of slideFiles) {
         // A single bad/unusual slide (malformed XML, an OOXML structure
         // this parser doesn't expect) must not take down the whole
@@ -157,6 +166,10 @@ const PptxViewer = (function () {
           const { clrScheme, layoutXdoc, masterXdoc } = await C.resolveSlideInheritance(zip, slidePath, inheritanceCache);
           const txStyles = C.parseTxStyles(masterXdoc, clrScheme);
           const relMap = await C.getRelsMap(zip, slidePath);
+
+          const rawXml = zip.file(slidePath) ? await zip.file(slidePath).async('text') : '';
+          if (rawXml.includes('<a:effectLst') || rawXml.includes('<a:effectDag')) nativeCapabilities.hasEffects = true;
+          if (rawXml.includes('<p:timing>')) nativeCapabilities.hasAnimations = true;
 
           const spTree = xdoc.getElementsByTagName('p:spTree')[0];
           const topLevelShapes = spTree ? Array.from(spTree.children) : [];
@@ -170,6 +183,11 @@ const PptxViewer = (function () {
           const shapes = await PptxShapes.extractShapes(topLevelShapes, {
             slideCx, slideCy, clrScheme, txStyles, zip, relMap, esc, defaultSizePt,
             slidePath, transform: PptxShapes.IDENTITY_TRANSFORM,
+          });
+          shapes.forEach(sh => {
+            if (sh.kind === 'chart') { nativeCapabilities.hasCharts = true; if (sh.degraded) nativeCapabilities.degradedChartCount++; }
+            if (sh.kind === 'smartart') nativeCapabilities.hasSmartArt = true;
+            if (sh.kind === 'unsupported-object') nativeCapabilities.hasUnsupportedObjects = true;
           });
           let title = '';
           const titleShape = shapes.find(sh => sh.kind === 'title');
@@ -210,8 +228,20 @@ const PptxViewer = (function () {
       const wrap = dom.content.querySelector('.dv-slides-wrap');
       const rail = dom.content.querySelector('#dv-slides-rail');
       const stage = dom.content.querySelector('#dv-slide-stage');
+      // Phase 6C: the high-fidelity fallback decision is computed once,
+      // here, and reused both for the info-panel note below and for the
+      // toolbar button itself (see PptxHighFidelity.attachButton near
+      // the end of this function) — PptxHighFidelity owns what the
+      // decision MEANS; this function only owns wiring it into its own
+      // DOM once.
+      const fidelityStrategy = (typeof PptxHighFidelity !== 'undefined')
+        ? PptxHighFidelity.getPresentationRenderStrategy(nativeCapabilities)
+        : { mode: 'native', reasons: [] };
+      const fidelityNoteRow = fidelityStrategy.reasons.length
+        ? `<div class="dv-info-row"><span class="k">ملاحظة</span><span class="v" style="font-size:.68rem;font-weight:500;color:#b5651d">${esc('قد يفيد العرض بجودة عالية لهذا الملف: ' + fidelityStrategy.reasons.join('؛ '))}</span></div>`
+        : '';
       setInfoExtra(`<div class="dv-info-row"><span class="k">عدد الشرائح</span><span class="v">${slides.length}</span></div>
-        <div class="dv-info-row"><span class="k">ملاحظة</span><span class="v" style="font-size:.68rem;font-weight:500">معاينة تقريبية تحاكي التصميم الأصلي (الخلفية والخطوط والألوان) — الرسوم المتحركة والتأثيرات المتقدمة غير مدعومة</span></div>`);
+        <div class="dv-info-row"><span class="k">ملاحظة</span><span class="v" style="font-size:.68rem;font-weight:500">معاينة تقريبية تحاكي التصميم الأصلي (الخلفية والخطوط والألوان) — الرسوم المتحركة والتأثيرات المتقدمة غير مدعومة</span></div>${fidelityNoteRow}`);
 
       // ── presentation-specific state (owned entirely by this engine) ──
       let current = 0;
@@ -341,6 +371,14 @@ const PptxViewer = (function () {
       });
       addSep();
       const presentBtn = addToolBtn('🖵 عرض تقديمي', 'وضع العرض التقديمي (ملء الشاشة، إخفاء قائمة الشرائح)', togglePresent);
+
+      // Phase 6C high-fidelity fallback — isolated in its own module;
+      // this is the entire adapter-level surface pptx-viewer.js needs
+      // (availability check, button, conversion, and the handoff to the
+      // existing PDF viewer all happen inside PptxHighFidelity itself).
+      if (typeof PptxHighFidelity !== 'undefined') {
+        PptxHighFidelity.attachButton(ctx, { code: state.code, filename: state.file.name, strategy: fidelityStrategy });
+      }
 
       function togglePresent() {
         presenting = !presenting;
